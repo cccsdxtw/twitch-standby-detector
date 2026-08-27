@@ -9,3 +9,10 @@ env/
 .DS_Store
 .idea/
 .vscode/
+.env
+twitch_token.json
+打包成品_*/
+build/
+dist/
+*.spec
+
