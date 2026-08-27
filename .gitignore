@@ -15,4 +15,7 @@ twitch_token.json
 build/
 dist/
 *.spec
+standby/*
+!standby/.gitkeep
+
 

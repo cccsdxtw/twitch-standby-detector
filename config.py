@@ -19,6 +19,11 @@ class Settings:
     user_logins: tuple[str, ...]
     discord_webhook_url: str
     simulate: bool
+    standby_dir: str
+    frame_interval_sec: float
+    ad_skip_sec: float
+    confirm_frames: int
+    hash_threshold: int
 
     @property
     def ready_for_eventsub(self) -> bool:
@@ -40,6 +45,26 @@ def _truthy(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 def load_settings() -> Settings:
     env_path = os.path.join(app_dir(), ".env")
     load_dotenv(env_path, override=False)
@@ -55,4 +80,9 @@ def load_settings() -> Settings:
         user_logins=logins,
         discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", "").strip(),
         simulate=simulate,
+        standby_dir=os.path.join(app_dir(), "standby"),
+        frame_interval_sec=max(_env_float("FRAME_INTERVAL_SEC", 3.0), 1.0),
+        ad_skip_sec=max(_env_float("AD_SKIP_SEC", 20.0), 0.0),
+        confirm_frames=max(_env_int("CONFIRM_FRAMES", 4), 1),
+        hash_threshold=max(_env_int("HASH_THRESHOLD", 16), 1),
     )

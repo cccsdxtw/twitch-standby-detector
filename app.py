@@ -1,4 +1,4 @@
-"""實況守門員 — Twitch EventSub + Tkinter UI (v0.2.0)"""
+"""實況守門員 — Twitch EventSub + 畫面抽幀判定 (v0.3.0)"""
 
 from __future__ import annotations
 
@@ -13,13 +13,13 @@ import httpx
 
 from config import Settings, load_settings
 from discord_notify import send_webhook
-from ffmpeg_monitor import simulate_ffmpeg_monitor
+from ffmpeg_monitor import monitor_broadcast, simulate_ffmpeg_monitor
 from paths import get_resource_path
 from twitch_eventsub import EventSubClient
 from twitch_helix import live_user_ids, resolve_users
 from twitch_oauth import TwitchAuthError, ensure_user_token
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 
 class StreamMonitorApp:
@@ -201,14 +201,18 @@ class StreamMonitorApp:
             for uid in live_ids:
                 login = id_to_login.get(uid, uid)
                 self.log(f"🔴 啟動時已在直播：{login}")
-                await self._start_monitor(login, settings, http, stop_event)
+                await self._start_monitor(
+                    login, settings, http, stop_event, already_live=True
+                )
 
             async def on_event(event_type: str, event: dict) -> None:
                 login = str(event.get("broadcaster_user_login") or "").lower()
                 name = event.get("broadcaster_user_name") or login
                 if event_type == "stream.online":
                     self.log(f"🚨 EventSub：{name} ({login}) 開台了！")
-                    await self._start_monitor(login, settings, http, stop_event)
+                    await self._start_monitor(
+                        login, settings, http, stop_event, already_live=False
+                    )
                 elif event_type == "stream.offline":
                     self.log(f"⚪ EventSub：{name} ({login}) 已下播")
                     self._cancel_monitor(login)
@@ -231,13 +235,16 @@ class StreamMonitorApp:
         settings: Settings,
         http: httpx.AsyncClient,
         stop_event: asyncio.Event,
+        already_live: bool = False,
     ) -> None:
         existing = self._monitor_tasks.get(login)
         if existing and not existing.done():
             self.log(f"ℹ️ {login} 已在監控中，略過重複啟動")
             return
         self._monitor_tasks[login] = asyncio.create_task(
-            self._monitor_wrapper(login, settings, http, stop_event)
+            self._monitor_wrapper(
+                login, settings, http, stop_event, already_live=already_live
+            )
         )
 
     def _cancel_monitor(self, login: str) -> None:
@@ -255,13 +262,23 @@ class StreamMonitorApp:
         settings: Settings,
         http: httpx.AsyncClient,
         stop_event: asyncio.Event,
+        already_live: bool = False,
     ) -> None:
         try:
-            started = await simulate_ffmpeg_monitor(login, self.log, stop_event)
+            if settings.simulate:
+                started = await simulate_ffmpeg_monitor(login, self.log, stop_event)
+            else:
+                started = await monitor_broadcast(
+                    login,
+                    settings,
+                    self.log,
+                    stop_event,
+                    already_live=already_live,
+                )
             if started and not stop_event.is_set():
                 await send_webhook(
                     settings.discord_webhook_url,
-                    f"🚨 [{login}] 畫面發生劇烈切換，正片開始！",
+                    f"🚨 [{login}] 畫面已離開待命，正片開始！",
                     client=http,
                     log=self.log,
                 )
