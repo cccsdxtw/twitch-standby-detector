@@ -12,6 +12,7 @@ env/
 .env
 twitch_token.json
 watchlist.txt
+watchlist.json
 ffmpeg.exe
 ffprobe.exe
 ffplay.exe

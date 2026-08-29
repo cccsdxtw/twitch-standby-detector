@@ -1,8 +1,8 @@
 # 實況守門員
 
-Twitch 待命畫面 / 正片切換監控。版本 **v0.5.0**。版本號避開 4。
+Twitch 待命畫面 / 正片切換監控。版本 **v0.6.1**。版本號避開 4。
 
-桌面程式：Tkinter + 背景 asyncio。EventSub 聽開台／下播，streamlink + FFmpeg 抽幀，dHash 比對待命畫面，正片開始後打 Discord Webhook。
+桌面程式：Tkinter + 背景 asyncio。EventSub 聽開台，streamlink + FFmpeg 抽幀，dHash 比對待命畫面，正片開始後打 Discord Webhook。
 
 ## 需求
 
@@ -15,13 +15,13 @@ Twitch 待命畫面 / 正片切換監控。版本 **v0.5.0**。版本號避開 4
 
 1. 打開程式後按 **「設定 ID / 網址」**，填 Twitch Client ID 與 Discord Webhook（存在本機 `.env`）。
 2. [Twitch Developer Console](https://dev.twitch.tv/console) 建立應用。Redirect URL 可填 `http://localhost`。第一次啟動會 Device Code 登入，token 存 `twitch_token.json`。
-3. 視窗裡新增頻道。每台可「選圖片」或「選影片」當待命樣本。建議一次不要超過 5 台。
+3. 視窗裡新增頻道。每台可開關「開台通知」與「開始通知」，並選待命圖片或影片。EventSub 即時約 10 台。
 5. **強烈建議**把待命截圖放到 `standby/<登入名>.png`（例如 `standby/lanmeinotbeer.png`）。沒有參考圖時：剛開台會試著抓穩定 baseline；**啟動時已經在直播則略過判定**。
 6. 沒憑證試 UI：`SIMULATE=1`。
 
 可調：`FRAME_INTERVAL_SEC`（預設 3）、`AD_SKIP_SEC`（20）、`CONFIRM_FRAMES`（連續 4 張不像待命才通知）、`HASH_THRESHOLD`（dHash 距離，預設 16）。
 
-WebSocket 訂閱成本上限約 10；online+offline 每台佔 2。
+EventSub 只訂 `stream.online`（每台成本 1，即時約 10 台）。不做 Helix 輪詢。
 
 ## 執行
 
@@ -29,20 +29,13 @@ WebSocket 訂閱成本上限約 10；online+offline 每台佔 2。
 python app.py
 ```
 
-流程：登入 Twitch → 補查已在直播 → EventSub → 開台抽幀 → 離開待命 → Discord。
+流程：登入 Twitch → 補查已在直播 → EventSub 開台 → 開台抽幀 → 離開待命 → Discord。
 
 ## 用萬用 PyInstaller 打包神器
 
-- 拖整個專案裡的 `app.py`（含 `import tkinter` → `-w`）
+邏輯都在 **`app.py` 一個檔**，直接拖進去即可（有 `import tkinter` → `-w`）。
+
 - 圖示：`get_resource_path("app_master_icon.ico")`
 - **FFmpeg 不會被打進 EXE**。把 `ffmpeg.exe` 放到 EXE 旁邊。
 - streamlink 資源較多；若 EXE 解析不到台，請改打包指令加上 `--collect-all streamlink`（萬用 bat 預設不會加）。
 - `.env`、`standby\` 截圖放 EXE 旁邊。
-
-## 架構
-
-- `twitch_eventsub.py`：WebSocket
-- `twitch_stream.py`：streamlink 解析 HLS
-- `ffmpeg_monitor.py`：FFmpeg 抽幀
-- `standby.py` / `image_hash.py`：dHash 判定（不依賴 OpenCV）
-- `paths.py`：打包後路徑

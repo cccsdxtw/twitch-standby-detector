@@ -7,16 +7,18 @@ from types import SimpleNamespace
 
 from PIL import Image, ImageDraw
 
-from image_hash import dhash_int, hamming_distance
-from standby import (
+from app import (
     StandbyDetector,
     describe_references,
+    dhash_int,
+    hamming_distance,
     hashes_are_stable,
     import_standby_image,
     list_reference_files,
     load_reference_hashes,
+    parse_height,
+    pick_stream,
 )
-from twitch_stream import pick_stream, parse_height
 
 
 def _scene(kind: str) -> Image.Image:

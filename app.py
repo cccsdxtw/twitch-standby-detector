@@ -1,31 +1,1636 @@
-"""實況守門員 — Twitch EventSub + 畫面抽幀判定 (v0.5.0)"""
+"""實況守門員 — 單檔版，方便拖進萬用 PyInstaller 打包。"""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import queue
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import threading
+import time
+import webbrowser
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
+from datetime import datetime
+from typing import Any
+
+import httpx
 import tkinter as tk
+from dotenv import load_dotenv
+from PIL import Image, UnidentifiedImageError
 from tkinter import filedialog, scrolledtext
+
+
+# === ui_theme.py ===
+
+import tkinter as tk
+
+BG = "#F3F3F3"
+PANEL = "#F3F3F3"
+LOG_BG = "#FFFFFF"
+FG = "#1A1A1A"
+MUTED = "#555555"
+OK = "#1B8A3A"
+WARN = "#B45309"
+ERR = "#B42318"
+
+ORANGE = "#E67A1A"
+RED = "#C0392B"
+BLUE = "#1E7FE0"
+NAVY = "#2C3E50"
+PURPLE = "#6C3BAA"
+GRAY = "#4A4A4A"
+GREEN = "#2E8B57"
+
+FONT = ("Microsoft JhengHei UI", 10)
+FONT_BOLD = ("Microsoft JhengHei UI", 11, "bold")
+FONT_TITLE = ("Microsoft JhengHei UI", 12, "bold")
+FONT_LOG = ("Microsoft JhengHei UI", 10)
+
+
+def apply_root(root: tk.Tk) -> None:
+    root.configure(bg=BG)
+    try:
+        root.option_add("*Font", FONT)
+    except tk.TclError:
+        pass
+
+
+def group(parent: tk.Widget, title: str) -> tk.LabelFrame:
+    box = tk.LabelFrame(
+        parent,
+        text=f" {title} ",
+        font=FONT_BOLD,
+        bg=PANEL,
+        fg=FG,
+        padx=10,
+        pady=8,
+        labelanchor="n",
+    )
+    return box
+
+
+def label(parent: tk.Widget, text: str, *, bold: bool = False, fg: str = FG) -> tk.Label:
+    return tk.Label(
+        parent,
+        text=text,
+        bg=getattr(parent, "cget", lambda _k: PANEL)("bg") if hasattr(parent, "cget") else PANEL,
+        fg=fg,
+        font=FONT_BOLD if bold else FONT,
+        anchor="w",
+    )
+
+
+def entry(parent: tk.Widget, textvariable: tk.StringVar | None = None, **kwargs) -> tk.Entry:
+    widget = tk.Entry(
+        parent,
+        textvariable=textvariable,
+        font=FONT,
+        relief=tk.SOLID,
+        bd=1,
+        **kwargs,
+    )
+    return widget
+
+
+def color_button(
+    parent: tk.Widget,
+    text: str,
+    command,
+    bg: str,
+    *,
+    fg: str = "white",
+    width: int | None = None,
+) -> tk.Button:
+    return tk.Button(
+        parent,
+        text=text,
+        command=command,
+        bg=bg,
+        fg=fg,
+        activebackground=bg,
+        activeforeground=fg,
+        font=FONT_BOLD,
+        relief=tk.FLAT,
+        padx=12,
+        pady=7,
+        cursor="hand2",
+        width=width,
+    )
+
+
+def small_button(parent: tk.Widget, text: str, command, bg: str) -> tk.Button:
+    return tk.Button(
+        parent,
+        text=text,
+        command=command,
+        bg=bg,
+        fg="white",
+        activebackground=bg,
+        activeforeground="white",
+        font=("Microsoft JhengHei UI", 9, "bold"),
+        relief=tk.FLAT,
+        padx=8,
+        pady=4,
+        cursor="hand2",
+    )
+
+
+# === paths.py ===
+
+import os
+import sys
+
+
+def app_dir() -> str:
+    """使用者可編輯檔案（.env、token）所在目錄：開發=腳本目錄，打包=EXE 目錄。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_resource_path(relative_path: str) -> str:
+    """打包神器會把圖示以 app_master_icon.ico 塞進程式內部，執行時從這裡讀。"""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base = sys._MEIPASS
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, relative_path)
+
+
+# === image_hash.py ===
+
+from PIL import Image
+
+
+def dhash_int(image: Image.Image, hash_size: int = 8) -> int:
+    gray = image.convert("L").resize(
+        (hash_size + 1, hash_size), Image.Resampling.LANCZOS
+    )
+    pixels = list(gray.getdata())
+    width = hash_size + 1
+    value = 0
+    for row in range(hash_size):
+        for col in range(hash_size):
+            left = pixels[row * width + col]
+            right = pixels[row * width + col + 1]
+            value = (value << 1) | int(left < right)
+    return value
+
+
+def hamming_distance(a: int, b: int) -> int:
+    return (a ^ b).bit_count()
+
+
+def min_distance(frame_hash: int, references: list[int]) -> int | None:
+    if not references:
+        return None
+    return min(hamming_distance(frame_hash, ref) for ref in references)
+
+
+# === tools.py ===
+
+import os
+import shutil
+import sys
+
+
+
+def find_executable(name: str) -> str | None:
+    names = [name]
+    if sys.platform == "win32" and not name.lower().endswith(".exe"):
+        names.append(f"{name}.exe")
+
+    bases = [app_dir()]
+    meipass = getattr(sys, "_MEIPASS", None)
+    if getattr(sys, "frozen", False) and meipass:
+        bases.append(meipass)
+
+    for base in bases:
+        for filename in names:
+            candidate = os.path.join(base, filename)
+            if os.path.isfile(candidate):
+                return candidate
+
+    for filename in names:
+        found = shutil.which(filename)
+        if found:
+            return found
+    return None
+
+
+def find_ffmpeg() -> str | None:
+    return find_executable("ffmpeg")
+
+
+def find_streamlink_cli() -> str | None:
+    return find_executable("streamlink")
+
+
+# === config.py ===
+
+import json
+import os
+import re
+from dataclasses import dataclass, replace
+
+from dotenv import load_dotenv
+
+
+DEFAULT_SIMULATE_LOGIN = "lanmeinotbeer"
+
+
+@dataclass(frozen=True)
+class Settings:
+    twitch_client_id: str
+    twitch_client_secret: str
+    user_logins: tuple[str, ...]
+    discord_webhook_url: str
+    simulate: bool
+    standby_dir: str
+    frame_interval_sec: float
+    ad_skip_sec: float
+    confirm_frames: int
+    hash_threshold: int
+
+    @property
+    def ready_for_eventsub(self) -> bool:
+        return bool(self.twitch_client_id) and not self.simulate
+
+    def with_logins(self, logins: tuple[str, ...]) -> Settings:
+        return replace(self, user_logins=logins)
+
+
+@dataclass(frozen=True)
+class ChannelPref:
+    login: str
+    notify_live: bool = True
+    notify_start: bool = True
+    display_name: str = ""
+
+
+def watchlist_path() -> str:
+    return os.path.join(app_dir(), "watchlist.txt")
+
+
+def watchlist_json_path() -> str:
+    return os.path.join(app_dir(), "watchlist.json")
+
+
+def normalize_login(item: str) -> str:
+    login = item.strip().lower().rstrip("/")
+    if "twitch.tv/" in login:
+        login = login.split("twitch.tv/", 1)[1]
+        login = login.split("?", 1)[0].split("/", 1)[0]
+    return login
+
+
+def parse_logins(raw: str) -> tuple[str, ...]:
+    parts = []
+    seen = set()
+    for item in re.split(r"[,;\s]+", raw):
+        login = normalize_login(item)
+        if login and login not in seen:
+            seen.add(login)
+            parts.append(login)
+    return tuple(parts)
+
+
+def load_watchlist_text() -> str:
+    path = watchlist_path()
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def save_watchlist(logins: tuple[str, ...]) -> None:
+    prefs = [ChannelPref(login=login) for login in logins]
+    save_channel_prefs(prefs)
+
+
+def load_channel_prefs() -> list[ChannelPref]:
+    json_path = watchlist_json_path()
+    if os.path.isfile(json_path):
+        try:
+            with open(json_path, encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except (OSError, json.JSONDecodeError, TypeError):
+            raw = []
+        prefs: list[ChannelPref] = []
+        seen: set[str] = set()
+        if isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                login = normalize_login(str(item.get("login") or ""))
+                if not login or login in seen:
+                    continue
+                seen.add(login)
+                prefs.append(
+                    ChannelPref(
+                        login=login,
+                        notify_live=bool(item.get("notify_live", True)),
+                        notify_start=bool(item.get("notify_start", True)),
+                        display_name=str(item.get("display_name") or ""),
+                    )
+                )
+        if prefs:
+            return prefs
+
+    logins = parse_logins(load_watchlist_text())
+    return [ChannelPref(login=login) for login in logins]
+
+
+def save_channel_prefs(prefs: list[ChannelPref]) -> None:
+    payload = [
+        {
+            "login": pref.login,
+            "notify_live": pref.notify_live,
+            "notify_start": pref.notify_start,
+            "display_name": pref.display_name,
+        }
+        for pref in prefs
+        if pref.login
+    ]
+    with open(watchlist_json_path(), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    with open(watchlist_path(), "w", encoding="utf-8") as handle:
+        handle.write("\n".join(item["login"] for item in payload))
+        if payload:
+            handle.write("\n")
+
+
+def env_path() -> str:
+    return os.path.join(app_dir(), ".env")
+
+
+def upsert_env_values(values: dict[str, str]) -> None:
+    """更新 .env 指定鍵，其餘註解與項目原樣保留。"""
+    path = env_path()
+    lines: list[str] = []
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+
+    seen: set[str] = set()
+    updated: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            updated.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in values:
+            updated.append(f"{key}={values[key]}")
+            seen.add(key)
+        else:
+            updated.append(line)
+    for key, value in values.items():
+        if key not in seen:
+            updated.append(f"{key}={value}")
+
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("\n".join(updated))
+        handle.write("\n")
+    load_dotenv(path, override=True)
+
+
+def _truthy(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def load_settings() -> Settings:
+    load_dotenv(env_path(), override=True)
+
+    simulate = _truthy(os.getenv("SIMULATE", "0"))
+    prefs = load_channel_prefs()
+    logins = tuple(pref.login for pref in prefs) or parse_logins(
+        os.getenv("TWITCH_USER_LOGINS", "")
+    )
+    if simulate and not logins:
+        logins = (DEFAULT_SIMULATE_LOGIN,)
+
+    return Settings(
+        twitch_client_id=os.getenv("TWITCH_CLIENT_ID", "").strip(),
+        twitch_client_secret=os.getenv("TWITCH_CLIENT_SECRET", "").strip(),
+        user_logins=logins,
+        discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", "").strip(),
+        simulate=simulate,
+        standby_dir=os.path.join(app_dir(), "standby"),
+        frame_interval_sec=max(_env_float("FRAME_INTERVAL_SEC", 3.0), 1.0),
+        ad_skip_sec=max(_env_float("AD_SKIP_SEC", 20.0), 0.0),
+        confirm_frames=max(_env_int("CONFIRM_FRAMES", 4), 1),
+        hash_threshold=max(_env_int("HASH_THRESHOLD", 16), 1),
+    )
+
+
+# === discord_notify.py ===
+
+from typing import Callable
 
 import httpx
 
-from config import Settings, load_settings, parse_logins, save_watchlist, upsert_env_values
-from discord_notify import send_webhook
-from ffmpeg_monitor import monitor_broadcast, simulate_ffmpeg_monitor
-from paths import get_resource_path
-from standby import (
-    clear_reference_files,
-    describe_references,
-    import_standby_image,
-    import_standby_video,
-)
-from twitch_eventsub import EventSubClient
-from twitch_helix import live_user_ids, resolve_users
-from twitch_oauth import TwitchAuthError, ensure_user_token
+LogFn = Callable[[str], None]
 
-__version__ = "0.5.0"
+
+def build_webhook_body(content: str) -> dict:
+    return {"content": content[:2000]}
+
+
+def build_live_message(display_name: str, login: str) -> str:
+    name = (display_name or login).strip() or login
+    handle = (login or "").strip().lower()
+    return f"「{name}」在實況了\n來去 https://www.twitch.tv/{handle} 看看"
+
+
+def build_start_message(display_name: str, login: str) -> str:
+    name = (display_name or login).strip() or login
+    handle = (login or "").strip().lower()
+    return f"「{name}」正片開始了\n來去 https://www.twitch.tv/{handle} 看看"
+
+
+async def send_webhook(
+    webhook_url: str,
+    content: str,
+    *,
+    client: httpx.AsyncClient,
+    log: LogFn,
+) -> None:
+    if not webhook_url:
+        log("ℹ️ 未設定 DISCORD_WEBHOOK_URL，略過 Discord 通知")
+        return
+    try:
+        response = await client.post(
+            webhook_url,
+            json=build_webhook_body(content),
+            timeout=30.0,
+        )
+        if response.status_code >= 400:
+            log(f"❌ Discord 通知失敗 HTTP {response.status_code}: {response.text[:300]}")
+            return
+        log("✅ 已發送 Discord 通知")
+    except httpx.HTTPError as exc:
+        log(f"❌ Discord 通知網路錯誤：{exc}")
+
+
+# === standby.py ===
+
+import os
+import subprocess
+
+from PIL import Image, UnidentifiedImageError
+
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
+
+
+def list_reference_files(standby_dir: str, login: str) -> list[str]:
+    if not os.path.isdir(standby_dir):
+        return []
+    login = login.lower()
+    found: list[str] = []
+    for name in sorted(os.listdir(standby_dir)):
+        stem, ext = os.path.splitext(name)
+        if ext.lower() not in IMAGE_EXTS:
+            continue
+        stem_l = stem.lower()
+        if stem_l == login or stem_l.startswith(f"{login}-") or stem_l.startswith(f"{login}_"):
+            found.append(os.path.join(standby_dir, name))
+    return found
+
+
+def load_reference_hashes(standby_dir: str, login: str) -> tuple[list[int], list[str]]:
+    hashes: list[int] = []
+    used: list[str] = []
+    for path in list_reference_files(standby_dir, login):
+        try:
+            with Image.open(path) as img:
+                img.load()
+                hashes.append(dhash_int(img))
+            used.append(path)
+        except (OSError, UnidentifiedImageError):
+            continue
+    return hashes, used
+
+
+def clear_reference_files(standby_dir: str, login: str) -> None:
+    os.makedirs(standby_dir, exist_ok=True)
+    for path in list_reference_files(standby_dir, login):
+        try:
+            os.remove(path)
+        except OSError:
+            continue
+
+
+def describe_references(standby_dir: str, login: str) -> str:
+    files = list_reference_files(standby_dir, login)
+    if not files:
+        return "尚未指定待命畫面"
+    if len(files) == 1:
+        return os.path.basename(files[0])
+    return f"{len(files)} 張待命樣本"
+
+
+def import_standby_image(standby_dir: str, login: str, source: str) -> list[str]:
+    login = login.lower()
+    os.makedirs(standby_dir, exist_ok=True)
+    clear_reference_files(standby_dir, login)
+    dest = os.path.join(standby_dir, f"{login}.png")
+    with Image.open(source) as img:
+        img.load()
+        img.convert("RGB").save(dest, "PNG")
+    return [dest]
+
+
+def import_standby_video(standby_dir: str, login: str, source: str) -> list[str]:
+    login = login.lower()
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("找不到 ffmpeg，無法從影片抽幀")
+    os.makedirs(standby_dir, exist_ok=True)
+    clear_reference_files(standby_dir, login)
+    pattern = os.path.join(standby_dir, f"{login}-%02d.png")
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        source,
+        "-vf",
+        "fps=1,scale=640:-1",
+        "-frames:v",
+        "5",
+        pattern,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    files = list_reference_files(standby_dir, login)
+    if result.returncode != 0 or not files:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(detail or "從影片抽幀失敗")
+    return files
+
+
+def hashes_are_stable(window: list[int], threshold: int) -> bool:
+    if len(window) < 3:
+        return False
+    sample = window[-3:]
+    for i in range(len(sample)):
+        for j in range(i + 1, len(sample)):
+            if hamming_distance(sample[i], sample[j]) > threshold:
+                return False
+    return True
+
+
+class StandbyDetector:
+    def __init__(self, references: list[int], threshold: int, confirm_frames: int) -> None:
+        self.references = list(references)
+        self.threshold = threshold
+        self.confirm_frames = max(int(confirm_frames), 1)
+        self.unlike_streak = 0
+
+    def set_references(self, references: list[int]) -> None:
+        self.references = list(references)
+        self.unlike_streak = 0
+
+    def observe(self, frame_hash: int) -> tuple[str, int | None]:
+        """回傳 (standby|pending|content, 與最近待命的距離)。"""
+        dist = min_distance(frame_hash, self.references)
+        if dist is None:
+            return "pending", None
+        if dist <= self.threshold:
+            self.unlike_streak = 0
+            return "standby", dist
+        self.unlike_streak += 1
+        if self.unlike_streak >= self.confirm_frames:
+            return "content", dist
+        return "pending", dist
+
+
+# === twitch_oauth.py ===
+
+import asyncio
+import json
+import os
+import time
+import webbrowser
+from dataclasses import dataclass
+from typing import Callable
+
+import httpx
+
+
+TOKEN_FILENAME = "twitch_token.json"
+DEVICE_URL = "https://id.twitch.tv/oauth2/device"
+TOKEN_URL = "https://id.twitch.tv/oauth2/token"
+DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+# stream.online 不需要額外 scope；空字串代表「無 scope 的使用者 token」。
+DEVICE_SCOPES = ""
+
+LogFn = Callable[[str], None]
+
+
+class TwitchAuthError(RuntimeError):
+    pass
+
+
+@dataclass
+class TokenPair:
+    access_token: str
+    refresh_token: str
+    expires_at: float
+
+    def access_valid(self, skew_seconds: float = 60) -> bool:
+        return bool(self.access_token) and time.time() < (self.expires_at - skew_seconds)
+
+
+def token_path() -> str:
+    return os.path.join(app_dir(), TOKEN_FILENAME)
+
+
+def load_token() -> TokenPair | None:
+    path = token_path()
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return TokenPair(
+            access_token=str(data.get("access_token", "")),
+            refresh_token=str(data.get("refresh_token", "")),
+            expires_at=float(data.get("expires_at", 0)),
+        )
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def save_token(pair: TokenPair) -> None:
+    path = token_path()
+    payload = {
+        "access_token": pair.access_token,
+        "refresh_token": pair.refresh_token,
+        "expires_at": pair.expires_at,
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+
+
+def token_from_response(data: dict) -> TokenPair:
+    expires_in = int(data.get("expires_in") or 0)
+    return TokenPair(
+        access_token=str(data.get("access_token", "")),
+        refresh_token=str(data.get("refresh_token", "")),
+        expires_at=time.time() + max(expires_in, 0),
+    )
+
+
+async def refresh_token(
+    client: httpx.AsyncClient,
+    client_id: str,
+    client_secret: str,
+    refresh: str,
+) -> TokenPair:
+    form = {
+        "client_id": client_id,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh,
+    }
+    if client_secret:
+        form["client_secret"] = client_secret
+    response = await client.post(TOKEN_URL, data=form, timeout=30.0)
+    data = response.json() if response.content else {}
+    if response.status_code >= 400 or not data.get("access_token"):
+        raise TwitchAuthError(f"刷新 token 失敗 HTTP {response.status_code}: {response.text[:400]}")
+    pair = token_from_response(data)
+    if not pair.refresh_token:
+        pair.refresh_token = refresh
+    save_token(pair)
+    return pair
+
+
+async def start_device_flow(
+    client: httpx.AsyncClient,
+    client_id: str,
+) -> dict:
+    form = {"client_id": client_id}
+    if DEVICE_SCOPES:
+        form["scopes"] = DEVICE_SCOPES
+    response = await client.post(DEVICE_URL, data=form, timeout=30.0)
+    if response.status_code >= 400:
+        raise TwitchAuthError(f"啟動 Device Code 失敗 HTTP {response.status_code}: {response.text[:400]}")
+    return response.json()
+
+
+async def poll_device_token(
+    client: httpx.AsyncClient,
+    client_id: str,
+    client_secret: str,
+    device_code: str,
+    interval: int,
+    expires_in: int,
+    stop_event: asyncio.Event,
+    log: LogFn,
+) -> TokenPair:
+    deadline = time.time() + max(expires_in, 30)
+    wait = max(int(interval), 1)
+    form = {
+        "client_id": client_id,
+        "device_code": device_code,
+        "grant_type": DEVICE_GRANT,
+    }
+    if DEVICE_SCOPES:
+        form["scopes"] = DEVICE_SCOPES
+    if client_secret:
+        form["client_secret"] = client_secret
+
+    while time.time() < deadline:
+        if stop_event.is_set():
+            raise TwitchAuthError("登入已取消")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=wait)
+            raise TwitchAuthError("登入已取消")
+        except asyncio.TimeoutError:
+            pass
+
+        response = await client.post(TOKEN_URL, data=form, timeout=30.0)
+        data = response.json() if response.content else {}
+        if response.status_code < 400 and data.get("access_token"):
+            pair = token_from_response(data)
+            save_token(pair)
+            return pair
+
+        message = str(data.get("message") or data.get("status") or "").lower()
+        if "pending" in message or response.status_code == 400 and "authorization_pending" in str(data):
+            continue
+        if "slow" in message:
+            wait += 5
+            log(f"⏳ Twitch 要求放慢輪詢，改為每 {wait} 秒一次")
+            continue
+        raise TwitchAuthError(f"Device Code 換 token 失敗 HTTP {response.status_code}: {response.text[:400]}")
+
+    raise TwitchAuthError("Device Code 已過期，請再按啟動重試")
+
+
+async def ensure_user_token(
+    client: httpx.AsyncClient,
+    client_id: str,
+    client_secret: str,
+    stop_event: asyncio.Event,
+    log: LogFn,
+) -> TokenPair:
+    stored = load_token()
+    if stored and stored.access_valid():
+        log("🔑 使用本機已儲存的 Twitch 使用者 token")
+        return stored
+    if stored and stored.refresh_token:
+        log("🔑 使用者 token 已過期，正在刷新…")
+        try:
+            return await refresh_token(client, client_id, client_secret, stored.refresh_token)
+        except TwitchAuthError as exc:
+            log(f"⚠️ 刷新失敗，改走瀏覽器登入：{exc}")
+
+    log("🔐 EventSub WebSocket 需要使用者登入（無額外權限）。")
+    device = await start_device_flow(client, client_id)
+    user_code = device.get("user_code", "")
+    uri = device.get("verification_uri", "https://www.twitch.tv/activate")
+    log(f"👉 請打開：{uri}")
+    log(f"👉 輸入代碼：{user_code}")
+    try:
+        webbrowser.open(uri)
+    except Exception:
+        pass
+    return await poll_device_token(
+        client,
+        client_id,
+        client_secret,
+        str(device.get("device_code", "")),
+        int(device.get("interval") or 5),
+        int(device.get("expires_in") or 1800),
+        stop_event,
+        log,
+    )
+
+
+# === twitch_helix.py ===
+
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+
+HELIX = "https://api.twitch.tv/helix"
+
+
+class TwitchAPIError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class TwitchUser:
+    login: str
+    user_id: str
+    display_name: str
+
+
+def _headers(client_id: str, access_token: str) -> dict[str, str]:
+    return {
+        "Client-Id": client_id,
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+
+
+async def _json(response: httpx.Response) -> Any:
+    if response.status_code >= 400:
+        raise TwitchAPIError(f"Helix HTTP {response.status_code}: {response.text[:500]}")
+    if not response.content:
+        return {}
+    return response.json()
+
+
+async def resolve_users(
+    client: httpx.AsyncClient,
+    client_id: str,
+    access_token: str,
+    logins: tuple[str, ...],
+) -> dict[str, TwitchUser]:
+    """login -> TwitchUser。找不到的 login 不會出現在結果裡。"""
+    if not logins:
+        return {}
+    params = [("login", login) for login in logins]
+    response = await client.get(
+        f"{HELIX}/users",
+        headers=_headers(client_id, access_token),
+        params=params,
+        timeout=30.0,
+    )
+    payload = await _json(response)
+    mapping: dict[str, TwitchUser] = {}
+    for user in payload.get("data") or []:
+        login = str(user.get("login", "")).lower()
+        uid = str(user.get("id", ""))
+        display = str(user.get("display_name") or user.get("login") or "")
+        if login and uid:
+            mapping[login] = TwitchUser(login=login, user_id=uid, display_name=display)
+    return mapping
+
+
+async def helix_token_for_lookup(
+    client: httpx.AsyncClient,
+    client_id: str,
+    client_secret: str,
+) -> str:
+    """查顯示名稱用：優先本機使用者 token，沒有再試 App token。失敗回空字串。"""
+    if not client_id:
+        return ""
+    stored = load_token()
+    if stored and stored.access_valid():
+        return stored.access_token
+    if stored and stored.refresh_token:
+        try:
+            pair = await refresh_token(client, client_id, client_secret, stored.refresh_token)
+            return pair.access_token
+        except TwitchAuthError:
+            pass
+    if not client_secret:
+        return ""
+    response = await client.post(
+        TOKEN_URL,
+        data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": "client_credentials",
+        },
+        timeout=30.0,
+    )
+    data = response.json() if response.content else {}
+    token = str(data.get("access_token") or "")
+    return token if response.status_code < 400 and token else ""
+
+
+async def live_user_ids(
+    client: httpx.AsyncClient,
+    client_id: str,
+    access_token: str,
+    user_ids: list[str],
+) -> set[str]:
+    if not user_ids:
+        return set()
+    live: set[str] = set()
+    for index in range(0, len(user_ids), 100):
+        chunk = user_ids[index : index + 100]
+        params = [("user_id", uid) for uid in chunk]
+        response = await client.get(
+            f"{HELIX}/streams",
+            headers=_headers(client_id, access_token),
+            params=params,
+            timeout=30.0,
+        )
+        payload = await _json(response)
+        for row in payload.get("data") or []:
+            uid = str(row.get("user_id", ""))
+            if uid:
+                live.add(uid)
+    return live
+
+
+async def create_eventsub_subscription(
+    client: httpx.AsyncClient,
+    client_id: str,
+    access_token: str,
+    event_type: str,
+    broadcaster_user_id: str,
+    session_id: str,
+) -> dict:
+    body = {
+        "type": event_type,
+        "version": "1",
+        "condition": {"broadcaster_user_id": broadcaster_user_id},
+        "transport": {"method": "websocket", "session_id": session_id},
+    }
+    response = await client.post(
+        f"{HELIX}/eventsub/subscriptions",
+        headers=_headers(client_id, access_token),
+        json=body,
+        timeout=30.0,
+    )
+    return await _json(response)
+
+
+# === twitch_stream.py ===
+
+import re
+from dataclasses import dataclass
+from typing import Any
+
+SKIP_KEYS = {"best", "worst", "audio_only"}
+HEIGHT_RE = re.compile(r"(\d+)p", re.IGNORECASE)
+
+
+class StreamResolveError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ResolvedStream:
+    quality: str
+    url: str | None
+
+
+def parse_height(quality: str) -> int | None:
+    match = HEIGHT_RE.search(quality)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def pick_stream(streams: dict[str, Any]) -> tuple[str, Any]:
+    ranked: list[tuple[int, str, Any]] = []
+    for key, stream in streams.items():
+        if key.lower() in SKIP_KEYS or "audio" in key.lower():
+            continue
+        height = parse_height(key)
+        ranked.append((height if height is not None else 9999, key, stream))
+    ranked.sort(key=lambda item: item[0])
+    under = [item for item in ranked if item[0] <= 480]
+    if under:
+        chosen = under[-1]
+        return chosen[1], chosen[2]
+    if ranked:
+        chosen = ranked[0]
+        return chosen[1], chosen[2]
+    for key in ("worst", "best"):
+        if key in streams:
+            return key, streams[key]
+    raise StreamResolveError("沒有可用的影像畫質")
+
+
+def resolve_twitch_stream(login: str) -> ResolvedStream:
+    from streamlink import Streamlink
+
+    session = Streamlink()
+    session.set_option("hls-live-edge", 2)
+    url = f"https://www.twitch.tv/{login}"
+    streams = None
+    last_error: Exception | None = None
+    try:
+        _, plugin_class, resolved_url = session.resolve_url(url)
+        try:
+            plugin = plugin_class(session, resolved_url, options={"disable-ads": True})
+        except TypeError:
+            plugin = plugin_class(session, resolved_url)
+            setter = getattr(getattr(plugin, "options", None), "set", None)
+            if callable(setter):
+                setter("disable-ads", True)
+        streams = plugin.streams()
+    except Exception as exc:
+        last_error = exc
+        try:
+            streams = session.streams(url)
+        except Exception as exc2:
+            raise StreamResolveError(str(exc2)) from exc2
+
+    if not streams:
+        raise StreamResolveError(str(last_error) if last_error else "找不到直播流（可能尚未真正開播）")
+
+    quality, stream = pick_stream(streams)
+    stream_url = getattr(stream, "url", None)
+    if stream_url:
+        stream_url = str(stream_url)
+    return ResolvedStream(quality=quality, url=stream_url)
+
+
+# === twitch_eventsub.py ===
+
+import asyncio
+import json
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+import httpx
+import websockets
+
+
+WS_URL = "wss://eventsub.wss.twitch.tv/ws"
+# 正片判定不靠 offline。只訂 online 省成本。
+EVENT_TYPES = ("stream.online",)
+# WebSocket 全帳號 max_total_cost=10；每台 online 佔 1。多連線不會加預算。
+MAX_EVENTSUB_CHANNELS = 10
+
+LogFn = Callable[[str], None]
+EventFn = Callable[[str, dict], Awaitable[None] | None]
+
+
+async def _recv_or_stop(ws: Any, stop_event: asyncio.Event, timeout: float) -> str | bytes | None:
+    """收到一則訊息；若使用者停止則回傳 None。逾時視為 keepalive 失敗。"""
+    recv_task = asyncio.create_task(ws.recv())
+    stop_task = asyncio.create_task(stop_event.wait())
+    try:
+        done, pending = await asyncio.wait(
+            {recv_task, stop_task},
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        if not done:
+            raise RuntimeError("EventSub keepalive 逾時")
+        if stop_task in done:
+            return None
+        return recv_task.result()
+    finally:
+        for task in (recv_task, stop_task):
+            if not task.done():
+                task.cancel()
+
+
+class EventSubReconnect(Exception):
+    def __init__(self, url: str) -> None:
+        super().__init__(url)
+        self.url = url
+
+
+def parse_ws_message(raw: str | bytes) -> tuple[str, dict[str, Any]]:
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    data = json.loads(raw)
+    metadata = data.get("metadata") or {}
+    return str(metadata.get("message_type") or ""), data
+
+
+def event_from_notification(data: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    payload = data.get("payload") or {}
+    subscription = payload.get("subscription") or {}
+    event = payload.get("event") or {}
+    return str(subscription.get("type") or ""), event
+
+
+class EventSubClient:
+    def __init__(
+        self,
+        *,
+        http: httpx.AsyncClient,
+        client_id: str,
+        access_token: str,
+        user_ids: dict[str, str],
+        log: LogFn,
+        on_event: EventFn,
+    ) -> None:
+        self.http = http
+        self.client_id = client_id
+        self.access_token = access_token
+        self.user_ids = user_ids
+        self.log = log
+        self.on_event = on_event
+
+    async def run(self, stop_event: asyncio.Event) -> None:
+        url = WS_URL
+        resubscribe = True
+        backoff = 2.0
+        while not stop_event.is_set():
+            try:
+                await self._run_session(url, resubscribe=resubscribe, stop_event=stop_event)
+                url = WS_URL
+                resubscribe = True
+                backoff = 2.0
+            except EventSubReconnect as exc:
+                self.log("🔄 收到 session_reconnect，改接新的 WebSocket…")
+                url = exc.url
+                resubscribe = False
+                backoff = 2.0
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if stop_event.is_set():
+                    return
+                self.log(f"⚠️ EventSub 連線中斷：{exc}，{backoff:.0f} 秒後重試")
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                url = WS_URL
+                resubscribe = True
+                backoff = min(backoff * 2, 60)
+
+    async def _run_session(
+        self,
+        url: str,
+        *,
+        resubscribe: bool,
+        stop_event: asyncio.Event,
+    ) -> None:
+        self.log(f"🔌 連線 EventSub：{url}")
+        async with websockets.connect(url, ping_interval=None, close_timeout=5) as ws:
+            welcome_raw = await _recv_or_stop(ws, stop_event, 15)
+            if welcome_raw is None:
+                return
+            msg_type, welcome = parse_ws_message(welcome_raw)
+            if msg_type != "session_welcome":
+                raise RuntimeError(f"預期 session_welcome，收到 {msg_type}")
+            session = (welcome.get("payload") or {}).get("session") or {}
+            session_id = str(session.get("id") or "")
+            keepalive = int(session.get("keepalive_timeout_seconds") or 10)
+            self.log(f"✅ EventSub session 已建立（keepalive {keepalive}s）")
+            if resubscribe:
+                await self._subscribe_all(session_id)
+            recv_timeout = keepalive + 5
+            while not stop_event.is_set():
+                raw = await _recv_or_stop(ws, stop_event, recv_timeout)
+                if raw is None:
+                    return
+                await self._dispatch(raw)
+
+    async def _subscribe_all(self, session_id: str) -> None:
+        for login, user_id in self.user_ids.items():
+            for event_type in EVENT_TYPES:
+                try:
+                    await create_eventsub_subscription(
+                        self.http,
+                        self.client_id,
+                        self.access_token,
+                        event_type,
+                        user_id,
+                        session_id,
+                    )
+                    self.log(f"📡 已訂閱 {event_type} → {login} ({user_id})")
+                except Exception as exc:
+                    self.log(f"❌ 訂閱 {event_type} / {login} 失敗：{exc}")
+
+    async def _dispatch(self, raw: str | bytes) -> None:
+        msg_type, data = parse_ws_message(raw)
+        if msg_type == "session_keepalive":
+            return
+        if msg_type == "session_reconnect":
+            session = (data.get("payload") or {}).get("session") or {}
+            reconnect_url = str(session.get("reconnect_url") or "")
+            if reconnect_url:
+                raise EventSubReconnect(reconnect_url)
+            return
+        if msg_type == "revocation":
+            sub = (data.get("payload") or {}).get("subscription") or {}
+            self.log(f"⚠️ 訂閱被撤銷：{sub.get('type')} status={sub.get('status')}")
+            return
+        if msg_type == "notification":
+            event_type, event = event_from_notification(data)
+            result = self.on_event(event_type, event)
+            if asyncio.iscoroutine(result):
+                await result
+            return
+        self.log(f"ℹ️ EventSub 未處理訊息類型：{msg_type}")
+
+
+# === ffmpeg_monitor.py ===
+
+import asyncio
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Callable
+
+from PIL import Image, UnidentifiedImageError
+
+
+LogFn = Callable[[str], None]
+
+
+async def simulate_ffmpeg_monitor(
+    broadcaster: str,
+    log: LogFn,
+    stop_event: asyncio.Event,
+) -> bool:
+    """回傳 True 代表模擬判定「正片開始」。"""
+    log(f"🎥 開始持續擷取 {broadcaster} 的 HLS 串流畫面...（模擬模式）")
+    for i in range(3, 0, -1):
+        if stop_event.is_set():
+            log(f"[{broadcaster}] 畫面監控已停止")
+            return False
+        log(f"[{broadcaster}] 畫面特徵分析中... ({i})")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=1.5)
+            log(f"[{broadcaster}] 畫面監控已停止")
+            return False
+        except asyncio.TimeoutError:
+            pass
+    log(f"🚨🚨 [{broadcaster}] 畫面發生劇烈切換，正片開始！")
+    return True
+
+
+async def monitor_broadcast(
+    broadcaster: str,
+    settings: Settings,
+    log: LogFn,
+    stop_event: asyncio.Event,
+    *,
+    already_live: bool,
+) -> bool:
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        log("❌ 找不到 ffmpeg。請安裝 FFmpeg 並加入 PATH，或把 ffmpeg.exe 放到程式同一個資料夾。")
+        return False
+
+    refs, used = load_reference_hashes(settings.standby_dir, broadcaster)
+    if used:
+        log(f"🖼️ [{broadcaster}] 待命參考圖：{', '.join(os.path.basename(p) for p in used)}")
+    elif already_live:
+        log(
+            f"ℹ️ [{broadcaster}] 啟動時已在直播且沒有 standby/{broadcaster}.png，"
+            "略過自動判定（避免把正片誤當成待命）。"
+        )
+        return False
+    else:
+        log(
+            f"ℹ️ [{broadcaster}] 沒有待命參考圖，將在略過廣告後嘗試建立穩定 baseline。"
+            f"建議放一張截圖到 standby/{broadcaster}.png"
+        )
+
+    tmp = tempfile.mkdtemp(prefix=f"standby-{broadcaster}-")
+    frame_path = os.path.join(tmp, "frame.jpg")
+    procs: list[asyncio.subprocess.Process] = []
+    try:
+        resolved = await _resolve_with_retry(broadcaster, log, stop_event)
+        if resolved is None:
+            return False
+        log(f"🎥 [{broadcaster}] 取得 {resolved.quality} 串流，開始抽幀…")
+        procs = await _start_grabbers(
+            ffmpeg, broadcaster, resolved.url, frame_path, settings.frame_interval_sec, log
+        )
+        if not procs:
+            return False
+        return await _watch_frames(
+            broadcaster,
+            settings,
+            log,
+            stop_event,
+            frame_path,
+            procs,
+            refs,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log(f"❌ [{broadcaster}] 畫面監控失敗：{exc}")
+        return False
+    finally:
+        await _kill_all(procs)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def _resolve_with_retry(
+    login: str,
+    log: LogFn,
+    stop_event: asyncio.Event,
+    attempts: int = 6,
+):
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        if stop_event.is_set():
+            return None
+        try:
+            return await asyncio.to_thread(resolve_twitch_stream, login)
+        except StreamResolveError as exc:
+            last_error = exc
+            log(f"⏳ [{login}] 尚未取得 HLS（{attempt}/{attempts}）：{exc}")
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=3)
+                return None
+            except asyncio.TimeoutError:
+                pass
+    raise StreamResolveError(str(last_error) if last_error else "無法解析串流")
+
+
+async def _start_grabbers(
+    ffmpeg: str,
+    login: str,
+    stream_url: str | None,
+    frame_path: str,
+    interval: float,
+    log: LogFn,
+) -> list[asyncio.subprocess.Process]:
+    if stream_url:
+        ff = await _spawn_ffmpeg(ffmpeg, ["-i", stream_url], frame_path, interval)
+        return [ff]
+    streamlink = find_streamlink_cli()
+    if not streamlink:
+        log(f"❌ [{login}] 解析結果沒有 URL，且找不到 streamlink 命令列可改走 pipe。")
+        return []
+    return await _spawn_pipe(ffmpeg, streamlink, login, frame_path, interval)
+
+
+def _ffmpeg_output_args(frame_path: str, interval: float) -> list[str]:
+    fps = 1.0 / max(interval, 1.0)
+    return [
+        "-an",
+        "-vf",
+        f"fps={fps}",
+        "-q:v",
+        "6",
+        "-update",
+        "1",
+        "-y",
+        frame_path,
+    ]
+
+
+def _creationflags() -> int:
+    if sys.platform == "win32":
+        return getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    return 0
+
+
+async def _spawn_ffmpeg(
+    ffmpeg: str,
+    input_args: list[str],
+    frame_path: str,
+    interval: float,
+) -> asyncio.subprocess.Process:
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_delay_max",
+        "15",
+        "-user_agent",
+        "Mozilla/5.0",
+        *input_args,
+        *_ffmpeg_output_args(frame_path, interval),
+    ]
+    kwargs: dict = {
+        "stdout": asyncio.subprocess.DEVNULL,
+        "stderr": asyncio.subprocess.PIPE,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = _creationflags()
+    else:
+        kwargs["start_new_session"] = True
+    return await asyncio.create_subprocess_exec(*cmd, **kwargs)
+
+
+async def _spawn_pipe(
+    ffmpeg: str,
+    streamlink: str,
+    login: str,
+    frame_path: str,
+    interval: float,
+) -> list[asyncio.subprocess.Process]:
+    sl_cmd = [
+        streamlink,
+        "--stdout",
+        "--twitch-disable-ads",
+        f"https://www.twitch.tv/{login}",
+        "480p,360p,160p,worst",
+    ]
+    flags = _creationflags()
+    sl_kwargs: dict = {
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+    }
+    ff_kwargs: dict = {
+        "stdin": None,
+        "stdout": asyncio.subprocess.DEVNULL,
+        "stderr": asyncio.subprocess.PIPE,
+    }
+    if sys.platform == "win32":
+        sl_kwargs["creationflags"] = flags
+        ff_kwargs["creationflags"] = flags
+    else:
+        sl_kwargs["start_new_session"] = True
+        ff_kwargs["start_new_session"] = True
+    sl = await asyncio.create_subprocess_exec(*sl_cmd, **sl_kwargs)
+    ff_cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        "pipe:0",
+        *_ffmpeg_output_args(frame_path, interval),
+    ]
+    ff_kwargs["stdin"] = sl.stdout
+    ff = await asyncio.create_subprocess_exec(*ff_cmd, **ff_kwargs)
+    if sl.stdout:
+        sl.stdout.close()
+    return [sl, ff]
+
+
+async def _watch_frames(
+    login: str,
+    settings: Settings,
+    log: LogFn,
+    stop_event: asyncio.Event,
+    frame_path: str,
+    procs: list[asyncio.subprocess.Process],
+    refs: list[int],
+) -> bool:
+    detector = StandbyDetector(refs, settings.hash_threshold, settings.confirm_frames)
+    started = time.monotonic()
+    last_sig: tuple[float, int] | None = None
+    recent: list[int] = []
+    ad_logged = False
+    stable_logged = False
+    standby_logs = 0
+    stderr_tasks = [asyncio.create_task(_collect_stderr(proc)) for proc in procs]
+
+    try:
+        while not stop_event.is_set():
+            dead = [proc for proc in procs if proc.returncode is not None]
+            if dead:
+                extras = []
+                for task in stderr_tasks:
+                    if task.done():
+                        extras.extend(task.result()[-6:])
+                detail = " | ".join(extras) if extras else f"exit={dead[0].returncode}"
+                log(f"❌ [{login}] 抽幀行程結束：{detail}")
+                return False
+
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(), timeout=max(settings.frame_interval_sec / 2, 0.5)
+                )
+                return False
+            except asyncio.TimeoutError:
+                pass
+
+            if not os.path.isfile(frame_path) or os.path.getsize(frame_path) == 0:
+                if time.monotonic() - started > 90:
+                    log(f"❌ [{login}] 90 秒內沒抽到畫面")
+                    return False
+                continue
+
+            sig = (os.path.getmtime(frame_path), os.path.getsize(frame_path))
+            if sig == last_sig:
+                continue
+            last_sig = sig
+
+            try:
+                with Image.open(frame_path) as img:
+                    img.load()
+                    frame_hash = dhash_int(img)
+            except (OSError, UnidentifiedImageError):
+                continue
+
+            elapsed = time.monotonic() - started
+            if elapsed < settings.ad_skip_sec:
+                if not ad_logged:
+                    log(f"⏳ [{login}] 略過開台前 {settings.ad_skip_sec:.0f} 秒（廣告／過場）")
+                    ad_logged = True
+                continue
+
+            if not detector.references:
+                recent.append(frame_hash)
+                recent = recent[-5:]
+                if hashes_are_stable(recent, settings.hash_threshold):
+                    detector.set_references(recent[-3:])
+                    log(f"📌 [{login}] 已建立穩定待命 baseline")
+                    stable_logged = True
+                elif elapsed > 90 and not stable_logged:
+                    log(
+                        f"⚠️ [{login}] 畫面遲遲不穩定，可能已在正片或待命是動態影片。"
+                        f"請改放 standby/{login}.png"
+                    )
+                    stable_logged = True
+                continue
+
+            state, dist = detector.observe(frame_hash)
+            bits = 64
+            if dist is None:
+                continue
+            if state == "standby":
+                standby_logs += 1
+                if standby_logs == 1 or standby_logs % 10 == 0:
+                    log(f"[{login}] 與待命差 {dist}/{bits}（像待命）")
+            elif state == "pending":
+                log(
+                    f"[{login}] 與待命差 {dist}/{bits}（不像 {detector.unlike_streak}/{settings.confirm_frames}）"
+                )
+            else:
+                log(f"🚨🚨 [{login}] 畫面已離開待命（差 {dist}/{bits}），正片開始！")
+                return True
+        return False
+    finally:
+        for task in stderr_tasks:
+            task.cancel()
+
+
+async def _collect_stderr(proc: asyncio.subprocess.Process) -> list[str]:
+    lines: list[str] = []
+    if proc.stderr is None:
+        return lines
+    try:
+        while True:
+            raw = await proc.stderr.readline()
+            if not raw:
+                break
+            text = raw.decode("utf-8", "replace").strip()
+            if text:
+                lines.append(text)
+                if len(lines) > 40:
+                    lines.pop(0)
+    except Exception:
+        pass
+    return lines
+
+
+async def _kill_all(procs: list[asyncio.subprocess.Process]) -> None:
+    for proc in procs:
+        if proc.returncode is not None:
+            continue
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            continue
+    for proc in procs:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            pass
+
+
+# === app ===
+
+__version__ = "0.6.1"
 
 
 class ChannelRow:
@@ -33,34 +1638,120 @@ class ChannelRow:
         self,
         master: tk.Widget,
         app: StreamMonitorApp,
-        login: str,
+        pref: ChannelPref,
         standby_dir: str,
     ) -> None:
         self.app = app
         self.standby_dir = standby_dir
-        self.frame = tk.Frame(master)
-        self.frame.pack(fill=tk.X, pady=3)
+        self.frame = tk.Frame(master, bg=PANEL)
+        self.frame.pack(fill=tk.X, pady=4)
 
-        self.login_var = tk.StringVar(value=login)
-        self.entry = tk.Entry(self.frame, textvariable=self.login_var, width=18)
+        self.login_var = tk.StringVar(value=pref.login)
+        self.entry = entry(self.frame, self.login_var, width=16)
         self.entry.pack(side=tk.LEFT, padx=(0, 6))
+        self.entry.bind("<FocusOut>", self._on_login_changed)
+        self.entry.bind("<Return>", self._on_login_changed)
 
-        self.status = tk.Label(self.frame, text="", anchor="w", width=22)
-        self.status.pack(side=tk.LEFT, padx=(0, 6))
+        self.name_var = tk.StringVar(value=pref.display_name.strip())
+        self.name_label = tk.Label(
+            self.frame,
+            textvariable=self.name_var,
+            anchor="w",
+            width=14,
+            bg=PANEL,
+            fg=MUTED,
+            font=FONT_BOLD,
+        )
+        self.name_label.pack(side=tk.LEFT, padx=(0, 8))
+        self._named_login = pref.login.lower() if pref.display_name.strip() else ""
 
-        self.img_btn = tk.Button(self.frame, text="選圖片", command=self._pick_image)
+        self.notify_live_var = tk.BooleanVar(value=pref.notify_live)
+        self.notify_start_var = tk.BooleanVar(value=pref.notify_start)
+        self.live_chk = tk.Checkbutton(
+            self.frame,
+            text="開台通知",
+            variable=self.notify_live_var,
+            command=self.app._persist_watchlist,
+            bg=PANEL,
+            font=FONT,
+            activebackground=PANEL,
+        )
+        self.live_chk.pack(side=tk.LEFT)
+        self.start_chk = tk.Checkbutton(
+            self.frame,
+            text="開始通知",
+            variable=self.notify_start_var,
+            command=self.app._persist_watchlist,
+            bg=PANEL,
+            font=FONT,
+            activebackground=PANEL,
+        )
+        self.start_chk.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.status = tk.Label(
+            self.frame, text="", anchor="w", width=18, bg=PANEL, font=FONT
+        )
+        self.status.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.img_btn = small_button(self.frame, "選圖片", self._pick_image, BLUE)
         self.img_btn.pack(side=tk.LEFT, padx=2)
-        self.vid_btn = tk.Button(self.frame, text="選影片", command=self._pick_video)
+        self.vid_btn = small_button(self.frame, "選影片", self._pick_video, PURPLE)
         self.vid_btn.pack(side=tk.LEFT, padx=2)
-        self.clear_btn = tk.Button(self.frame, text="清素材", command=self._clear_media)
+        self.clear_btn = small_button(self.frame, "清素材", self._clear_media, GRAY)
         self.clear_btn.pack(side=tk.LEFT, padx=2)
-        self.remove_btn = tk.Button(self.frame, text="移除", command=self._remove)
+        self.remove_btn = small_button(self.frame, "移除", self._remove, RED)
         self.remove_btn.pack(side=tk.LEFT, padx=2)
         self.refresh_status()
 
     def login(self) -> str:
         parsed = parse_logins(self.login_var.get())
         return parsed[0] if parsed else ""
+
+    def to_pref(self) -> ChannelPref | None:
+        name = self.login()
+        if not name:
+            return None
+        return ChannelPref(
+            login=name,
+            notify_live=bool(self.notify_live_var.get()),
+            notify_start=bool(self.notify_start_var.get()),
+            display_name=self._saved_display_name(),
+        )
+
+    def _saved_display_name(self) -> str:
+        text = self.name_var.get().strip()
+        if text in {"查名字中…", "找不到這台"}:
+            return ""
+        return text
+
+    def set_display_name(self, name: str, *, missing: bool = False) -> None:
+        login = self.login()
+        text = name.strip()
+        if missing:
+            self._named_login = login
+            self.name_var.set("找不到這台")
+            self.name_label.config(fg=ERR)
+            return
+        self._named_login = login if text else ""
+        self.name_var.set(text)
+        self.name_label.config(fg=FG if text else MUTED)
+
+    def _on_login_changed(self, _event=None) -> None:
+        login = self.login()
+        self.refresh_status()
+        if not login:
+            self.set_display_name("")
+            self.app._persist_watchlist()
+            return
+        if login == self._named_login and self.name_var.get().strip() not in {
+            "",
+            "查名字中…",
+            "找不到這台",
+        }:
+            return
+        self.set_display_name("查名字中…")
+        self.app._schedule_name_lookup((login,))
+        self.app._persist_watchlist()
 
     def refresh_status(self) -> None:
         name = self.login()
@@ -143,50 +1834,42 @@ class SettingsWindow(tk.Toplevel):
     def __init__(self, app: StreamMonitorApp) -> None:
         super().__init__(app.root)
         self.app = app
-        self.title("設定")
-        self.geometry("560x320")
+        self.title("修改設定")
+        self.geometry("560x360")
+        self.configure(bg=BG)
         self.transient(app.root)
         current = load_settings()
 
-        tk.Label(self, text="這些存在本機 .env，不會上傳 Git。改完按儲存即可。").pack(
-            anchor="w", padx=12, pady=(12, 8)
+        box = group(self, "連線與通知")
+        box.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+        label(box, "這些存在本機 .env，不會上傳 Git。改完按儲存套用即可。").pack(
+            anchor="w", pady=(0, 8)
         )
 
-        self.client_id = self._field(
-            "Twitch Client ID", current.twitch_client_id, show=""
-        )
+        self.client_id = self._field(box, "Twitch Client ID", current.twitch_client_id, "")
         self.client_secret = self._field(
-            "Twitch Client Secret（可空）", current.twitch_client_secret, show="*"
+            box, "Twitch Client Secret（可空）", current.twitch_client_secret, "*"
         )
         self.webhook = self._field(
-            "Discord Webhook 網址", current.discord_webhook_url, show=""
+            box, "Discord Webhook 網址", current.discord_webhook_url, ""
         )
 
-        tk.Label(
-            self,
-            text="Client ID：Twitch 開發者主控台 → 應用程式 → 管理\n"
+        label(
+            box,
+            "Client ID：Twitch 開發者主控台 → 應用程式 → 管理\n"
             "Webhook：Discord 頻道設定 → 整合 → Webhook → 複製網址",
-            justify="left",
-            fg="#444444",
-        ).pack(anchor="w", padx=12, pady=(4, 8))
+        ).pack(anchor="w", pady=(4, 8))
 
-        btns = tk.Frame(self)
-        btns.pack(pady=8)
-        tk.Button(btns, text="儲存", command=self._save, width=10).pack(
-            side=tk.LEFT, padx=6
-        )
-        tk.Button(btns, text="關閉", command=self.destroy, width=10).pack(
-            side=tk.LEFT, padx=6
-        )
+        color_button(box, "💾  儲存套用", self._save, ORANGE).pack(fill=tk.X, pady=(4, 0))
 
-    def _field(self, label: str, value: str, show: str) -> tk.Entry:
-        box = tk.Frame(self)
-        box.pack(fill=tk.X, padx=12, pady=4)
-        tk.Label(box, text=label, anchor="w").pack(fill=tk.X)
-        entry = tk.Entry(box, show=show)
-        entry.pack(fill=tk.X)
-        entry.insert(0, value)
-        return entry
+    def _field(self, parent: tk.Widget, title: str, value: str, show: str) -> tk.Entry:
+        box = tk.Frame(parent, bg=PANEL)
+        box.pack(fill=tk.X, pady=4)
+        label(box, title).pack(fill=tk.X)
+        widget = entry(box, None, show=show)
+        widget.pack(fill=tk.X)
+        widget.insert(0, value)
+        return widget
 
     def _save(self) -> None:
         try:
@@ -208,8 +1891,9 @@ class SettingsWindow(tk.Toplevel):
 class StreamMonitorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title(f"實況守門員 v{__version__}")
-        self.root.geometry("760x620")
+        self.root.title(f"實況守門員 主控台 V{__version__}")
+        self.root.geometry("920x720")
+        apply_root(root)
         self._apply_icon()
 
         self.msg_queue: queue.Queue[str] = queue.Queue()
@@ -219,64 +1903,73 @@ class StreamMonitorApp:
         self._bg_done = threading.Event()
         self._monitor_tasks: dict[str, asyncio.Task] = {}
         self._active_logins: tuple[str, ...] = ()
+        self._active_prefs: dict[str, ChannelPref] = {}
+        self._display_names: dict[str, str] = {}
         self.rows: list[ChannelRow] = []
 
         initial = load_settings()
         self.standby_dir = initial.standby_dir
 
-        top = tk.Frame(root)
-        top.pack(fill=tk.X, padx=12, pady=(10, 0))
-        tk.Label(
-            top,
-            text="每台一列：填頻道名稱，並指定待命圖片或待命影片（影片會抽幾幀當樣本）",
-            anchor="w",
-        ).pack(fill=tk.X)
-
-        add_row = tk.Frame(root)
-        add_row.pack(fill=tk.X, padx=12, pady=(6, 0))
-        self.add_var = tk.StringVar()
-        tk.Entry(add_row, textvariable=self.add_var, width=22).pack(side=tk.LEFT)
-        tk.Button(add_row, text="新增頻道", command=self._add_from_entry).pack(
-            side=tk.LEFT, padx=6
+        header = tk.Frame(root, bg=BG)
+        header.pack(fill=tk.X, padx=14, pady=(12, 6))
+        self.status_dot = tk.Label(header, text="●", fg=OK, bg=BG, font=FONT_BOLD)
+        self.status_dot.pack(side=tk.LEFT)
+        self.status_label = tk.Label(
+            header, text="狀態：待命", fg=OK, bg=BG, font=FONT_BOLD
         )
-        tk.Button(add_row, text="設定 ID / 網址", command=self.open_settings).pack(
-            side=tk.LEFT, padx=6
-        )
-        self.settings_status = tk.Label(add_row, text="", fg="#333333")
-        self.settings_status.pack(side=tk.LEFT, padx=10)
+        self.status_label.pack(side=tk.LEFT, padx=6)
+        self.settings_status = tk.Label(header, text="", fg="#555555", bg=BG, font=FONT)
+        self.settings_status.pack(side=tk.LEFT, padx=12)
+        color_button(header, "⚙  修改設定", self.open_settings, NAVY).pack(side=tk.RIGHT)
         self.refresh_settings_status()
 
-        self.list_frame = tk.Frame(root)
-        self.list_frame.pack(fill=tk.X, padx=12, pady=(8, 0))
-
-        logins = initial.user_logins or ("",)
-        for login in logins:
-            self._add_row(login)
-
-        btn_row = tk.Frame(root)
-        btn_row.pack(pady=10)
-
-        self.start_btn = tk.Button(
-            btn_row,
-            text="🚀 啟動自動監控",
-            font=("Arial", 12),
-            command=self.start_system,
+        watch = group(root, "監看頻道")
+        watch.pack(fill=tk.X, padx=14, pady=6)
+        label(
+            watch,
+            "每台可分開開關「開台通知」與「開始通知」，並指定待命圖片或影片。",
+        ).pack(fill=tk.X, pady=(0, 6))
+        add_row = tk.Frame(watch, bg=PANEL)
+        add_row.pack(fill=tk.X, pady=(0, 6))
+        self.add_var = tk.StringVar()
+        entry(add_row, self.add_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        color_button(add_row, "＋ 新增頻道", self._add_from_entry, ORANGE).pack(
+            side=tk.LEFT, padx=(8, 0)
         )
-        self.start_btn.pack(side=tk.LEFT, padx=6)
+        self.list_frame = tk.Frame(watch, bg=PANEL)
+        self.list_frame.pack(fill=tk.X)
 
-        self.stop_btn = tk.Button(
-            btn_row,
-            text="停止",
-            font=("Arial", 12),
-            command=self.stop_system,
-            state=tk.DISABLED,
+        prefs = load_channel_prefs()
+        if not prefs and initial.user_logins:
+            prefs = [ChannelPref(login=login) for login in initial.user_logins]
+        if not prefs:
+            prefs = [ChannelPref(login="")]
+        for pref in prefs:
+            self._add_row(pref)
+        self._schedule_name_lookup()
+
+        control = group(root, "監控控制")
+        control.pack(fill=tk.X, padx=14, pady=6)
+        self.start_btn = color_button(
+            control, "▶  啟動自動監控", self.start_system, GREEN
         )
-        self.stop_btn.pack(side=tk.LEFT, padx=6)
+        self.start_btn.pack(fill=tk.X, pady=(0, 6))
+        self.stop_btn = color_button(control, "■  停止監控", self.stop_system, RED)
+        self.stop_btn.pack(fill=tk.X)
+        self.stop_btn.config(state=tk.DISABLED)
 
+        log_box = group(root, "近期事件日誌")
+        log_box.pack(fill=tk.BOTH, expand=True, padx=14, pady=(6, 14))
         self.log_area = scrolledtext.ScrolledText(
-            root, width=88, height=16, state="disabled"
+            log_box,
+            height=14,
+            state="disabled",
+            font=FONT_LOG,
+            bg="white",
+            relief=tk.SOLID,
+            bd=1,
         )
-        self.log_area.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+        self.log_area.pack(fill=tk.BOTH, expand=True)
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self.process_queue)
@@ -288,7 +1981,12 @@ class StreamMonitorApp:
         settings = load_settings()
         client = "已填" if settings.twitch_client_id else "未填"
         hook = "已填" if settings.discord_webhook_url else "未填"
-        self.settings_status.config(text=f"Twitch Client ID：{client}　Discord：{hook}")
+        self.settings_status.config(text=f"Client ID：{client}　Discord：{hook}")
+
+    def set_run_status(self, text: str, *, ok: bool = True) -> None:
+        color = OK if ok else RED
+        self.status_dot.config(fg=color)
+        self.status_label.config(text=text, fg=color)
 
     def _apply_icon(self) -> None:
         ico = get_resource_path("app_master_icon.ico")
@@ -309,12 +2007,16 @@ class StreamMonitorApp:
             if login in existing:
                 self.log(f"ℹ️ {login} 已在名單裡")
                 continue
-            self._add_row(login)
+            self._add_row(ChannelPref(login=login))
+            self._schedule_name_lookup((login,))
         self.add_var.set("")
         self._persist_watchlist()
 
-    def _add_row(self, login: str) -> None:
-        self.rows.append(ChannelRow(self.list_frame, self, login, self.standby_dir))
+    def _add_row(self, pref: ChannelPref) -> None:
+        row = ChannelRow(self.list_frame, self, pref, self.standby_dir)
+        if pref.login and not pref.display_name.strip():
+            row.set_display_name("查名字中…")
+        self.rows.append(row)
 
     def _remove_row(self, row: ChannelRow) -> None:
         if row in self.rows:
@@ -326,21 +2028,94 @@ class StreamMonitorApp:
         for row in self.rows:
             row.set_enabled(enabled)
 
-    def _logins_from_ui(self) -> tuple[str, ...]:
-        logins: list[str] = []
+    def _prefs_from_ui(self) -> list[ChannelPref]:
+        prefs: list[ChannelPref] = []
         seen: set[str] = set()
         for row in self.rows:
-            login = row.login()
-            if login and login not in seen:
-                seen.add(login)
-                logins.append(login)
-        return tuple(logins)
+            pref = row.to_pref()
+            if pref is None or pref.login in seen:
+                continue
+            seen.add(pref.login)
+            prefs.append(pref)
+        return prefs
+
+    def _logins_from_ui(self) -> tuple[str, ...]:
+        return tuple(pref.login for pref in self._prefs_from_ui())
 
     def _persist_watchlist(self) -> None:
+        prefs = self._prefs_from_ui()
         try:
-            save_watchlist(self._logins_from_ui())
+            save_channel_prefs(prefs)
         except OSError as exc:
             self.log(f"⚠️ 無法儲存頻道名單：{exc}")
+            return
+        self._active_prefs = {pref.login: pref for pref in prefs}
+
+    def _schedule_name_lookup(self, logins: tuple[str, ...] | None = None) -> None:
+        targets = logins if logins is not None else self._logins_from_ui()
+        targets = tuple(login for login in targets if login)
+        if not targets:
+            return
+        threading.Thread(
+            target=self._lookup_names_worker,
+            args=(targets,),
+            daemon=True,
+        ).start()
+
+    def _lookup_names_worker(self, logins: tuple[str, ...]) -> None:
+        try:
+            users, missing = asyncio.run(self._lookup_names_async(logins))
+        except Exception as exc:
+            self.log(f"⚠️ 查頻道名字失敗：{exc}")
+            return
+        self.root.after(0, lambda: self._apply_display_names(logins, users, missing))
+
+    async def _lookup_names_async(
+        self, logins: tuple[str, ...]
+    ) -> tuple[dict[str, TwitchUser], list[str]]:
+        settings = load_settings()
+        if settings.simulate or not settings.twitch_client_id:
+            return {}, []
+        async with httpx.AsyncClient() as client:
+            token = await helix_token_for_lookup(
+                client,
+                settings.twitch_client_id,
+                settings.twitch_client_secret,
+            )
+            if not token:
+                return {}, []
+            users = await resolve_users(
+                client,
+                settings.twitch_client_id,
+                token,
+                logins,
+            )
+        missing = [login for login in logins if login not in users]
+        return users, missing
+
+    def _apply_display_names(
+        self,
+        requested: tuple[str, ...],
+        users: dict[str, TwitchUser],
+        missing: list[str],
+    ) -> None:
+        if not users and not missing:
+            for row in self.rows:
+                if row.name_var.get().strip() == "查名字中…":
+                    row.set_display_name("")
+            return
+        wanted = set(requested)
+        for row in self.rows:
+            login = row.login()
+            if login not in wanted:
+                continue
+            user = users.get(login)
+            if user:
+                row.set_display_name(user.display_name)
+                self._display_names[login] = user.display_name or login
+            elif login in missing:
+                row.set_display_name("", missing=True)
+        self._persist_watchlist()
 
     def log(self, message: str) -> None:
         self.msg_queue.put(message)
@@ -349,7 +2124,8 @@ class StreamMonitorApp:
         while not self.msg_queue.empty():
             msg = self.msg_queue.get()
             self.log_area.config(state="normal")
-            self.log_area.insert(tk.END, msg + "\n")
+            stamp = datetime.now().strftime("%H:%M:%S")
+            self.log_area.insert(tk.END, f"[{stamp}] {msg}\n")
             self.log_area.see(tk.END)
             self.log_area.config(state="disabled")
         if self._bg_done.is_set():
@@ -358,26 +2134,31 @@ class StreamMonitorApp:
         self.root.after(100, self.process_queue)
 
     def _reset_buttons(self) -> None:
-        self.start_btn.config(state=tk.NORMAL, text="🚀 啟動自動監控")
+        self.start_btn.config(state=tk.NORMAL, text="▶  啟動自動監控")
         self.stop_btn.config(state=tk.DISABLED)
         self._set_rows_enabled(True)
+        self.set_run_status("狀態：已停止")
 
     def start_system(self) -> None:
         logins = self._logins_from_ui()
         if not logins:
             self.log("❌ 請至少新增一個頻道")
             return
-        if len(logins) > 5:
+        if len(logins) > MAX_EVENTSUB_CHANNELS:
+            extra = len(logins) - MAX_EVENTSUB_CHANNELS
             self.log(
-                f"⚠️ 目前 {len(logins)} 台；EventSub 每台佔 2 點成本、上限約 10，超過 5 台可能訂閱失敗。"
+                f"⚠️ 目前 {len(logins)} 台，EventSub 即時上限約 {MAX_EVENTSUB_CHANNELS} 台，"
+                f"後面 {extra} 台這次先不聽。"
             )
         self._persist_watchlist()
         self._active_logins = logins
+        self._active_prefs = {pref.login: pref for pref in self._prefs_from_ui()}
         self._set_rows_enabled(False)
         self._stop_requested = False
         self.start_btn.config(state=tk.DISABLED, text="監控運行中...")
         self.stop_btn.config(state=tk.NORMAL)
-        self.log("系統啟動，準備進入背景執行緒...")
+        self.set_run_status("狀態：監控中")
+        self.log("☑️ 系統啟動，準備進入背景執行緒...")
         self.log(f"👀 將監看：{', '.join(logins)}")
         threading.Thread(target=self.run_asyncio_loop, daemon=True).start()
 
@@ -460,56 +2241,126 @@ class StreamMonitorApp:
             if stop_event.is_set():
                 return
 
-            mapping = await resolve_users(
+            users = await resolve_users(
                 http,
                 settings.twitch_client_id,
                 token.access_token,
                 settings.user_logins,
             )
-            missing = [login for login in settings.user_logins if login not in mapping]
+            missing = [login for login in settings.user_logins if login not in users]
             for login in missing:
                 self.log(f"⚠️ 找不到 Twitch 使用者：{login}")
-            if not mapping:
+            if not users:
                 self.log("❌ 沒有任何有效頻道可訂閱")
                 return
 
-            id_to_login = {uid: login for login, uid in mapping.items()}
+            user_ids = {login: user.user_id for login, user in users.items()}
+            self._display_names = {
+                login: user.display_name or login for login, user in users.items()
+            }
+            found = dict(users)
+            self.root.after(
+                0,
+                lambda: self._apply_display_names(tuple(found), found, []),
+            )
+            id_to_login = {user.user_id: login for login, user in users.items()}
+            ordered = [login for login in settings.user_logins if login in user_ids]
+            eventsub_ids = {
+                login: user_ids[login] for login in ordered[:MAX_EVENTSUB_CHANNELS]
+            }
+            skipped = [login for login in ordered if login not in eventsub_ids]
             live_ids = await live_user_ids(
                 http,
                 settings.twitch_client_id,
                 token.access_token,
-                list(mapping.values()),
+                list(user_ids.values()),
             )
             for uid in live_ids:
-                login = id_to_login.get(uid, uid)
-                self.log(f"🔴 啟動時已在直播：{login}")
-                await self._start_monitor(
-                    login, settings, http, stop_event, already_live=True
-                )
+                login = id_to_login.get(uid)
+                if login:
+                    await self._channel_went_live(
+                        login,
+                        settings,
+                        http,
+                        stop_event,
+                        source="啟動掃描",
+                        already_live=True,
+                    )
 
             async def on_event(event_type: str, event: dict) -> None:
                 login = str(event.get("broadcaster_user_login") or "").lower()
-                name = event.get("broadcaster_user_name") or login
-                if event_type == "stream.online":
-                    self.log(f"🚨 EventSub：{name} ({login}) 開台了！")
-                    await self._start_monitor(
-                        login, settings, http, stop_event, already_live=False
+                name = str(event.get("broadcaster_user_name") or login)
+                if name:
+                    self._display_names[login] = name
+                    self.root.after(
+                        0,
+                        lambda lg=login, nm=name: self._apply_display_names(
+                            (lg,),
+                            {
+                                lg: TwitchUser(
+                                    login=lg, user_id="", display_name=nm
+                                )
+                            },
+                            [],
+                        ),
                     )
-                elif event_type == "stream.offline":
-                    self.log(f"⚪ EventSub：{name} ({login}) 已下播")
-                    self._cancel_monitor(login)
+                if event_type == "stream.online":
+                    await self._channel_went_live(
+                        login,
+                        settings,
+                        http,
+                        stop_event,
+                        source="EventSub",
+                        already_live=False,
+                    )
 
             client = EventSubClient(
                 http=http,
                 client_id=settings.twitch_client_id,
                 access_token=token.access_token,
-                user_ids=mapping,
+                user_ids=eventsub_ids,
                 log=self.log,
                 on_event=on_event,
             )
-            self.log("✅ Twitch EventSub WebSocket 監聽模組已啟動")
+            if eventsub_ids:
+                self.log(f"⚡ EventSub 聽開台：{', '.join(eventsub_ids)}")
+            if skipped:
+                self.log(f"⚠️ 超過即時上限，這次不聽：{', '.join(skipped)}")
+            self.log("✅ Twitch EventSub 已啟動")
             await client.run(stop_event)
             self._cancel_all_monitors()
+
+    async def _channel_went_live(
+        self,
+        login: str,
+        settings: Settings,
+        http: httpx.AsyncClient,
+        stop_event: asyncio.Event,
+        *,
+        source: str,
+        already_live: bool,
+    ) -> None:
+        existing = self._monitor_tasks.get(login)
+        if existing and not existing.done():
+            return
+        name = self._display_names.get(login, login)
+        if already_live:
+            self.log(f"🔴 啟動時已在直播：{name} ({login})")
+        else:
+            self.log(f"🚨 {source}：{name} ({login}) 開台了！")
+            pref = self._active_prefs.get(login) or ChannelPref(login=login)
+            if pref.notify_live:
+                await send_webhook(
+                    settings.discord_webhook_url,
+                    build_live_message(name, login),
+                    client=http,
+                    log=self.log,
+                )
+            else:
+                self.log(f"ℹ️ [{login}] 開台通知已關閉")
+        await self._start_monitor(
+            login, settings, http, stop_event, already_live=already_live
+        )
 
     async def _start_monitor(
         self,
@@ -519,6 +2370,10 @@ class StreamMonitorApp:
         stop_event: asyncio.Event,
         already_live: bool = False,
     ) -> None:
+        pref = self._active_prefs.get(login) or ChannelPref(login=login)
+        if not pref.notify_start:
+            self.log(f"ℹ️ [{login}] 開始通知已關閉，不抽幀判定")
+            return
         existing = self._monitor_tasks.get(login)
         if existing and not existing.done():
             self.log(f"ℹ️ {login} 已在監控中，略過重複啟動")
@@ -558,12 +2413,15 @@ class StreamMonitorApp:
                     already_live=already_live,
                 )
             if started and not stop_event.is_set():
-                await send_webhook(
-                    settings.discord_webhook_url,
-                    f"🚨 [{login}] 畫面已離開待命，正片開始！",
-                    client=http,
-                    log=self.log,
-                )
+                pref = self._active_prefs.get(login) or ChannelPref(login=login)
+                if pref.notify_start:
+                    display = self._display_names.get(login, login)
+                    await send_webhook(
+                        settings.discord_webhook_url,
+                        build_start_message(display, login),
+                        client=http,
+                        log=self.log,
+                    )
         except asyncio.CancelledError:
             self.log(f"[{login}] 監控任務已取消")
         finally:
