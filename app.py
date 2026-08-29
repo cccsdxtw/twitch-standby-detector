@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import queue
 import re
@@ -168,7 +169,30 @@ def get_resource_path(relative_path: str) -> str:
 from PIL import Image
 
 
-def dhash_int(image: Image.Image, hash_size: int = 8) -> int:
+DHASH_SIZE = 8
+DHASH_BITS = DHASH_SIZE * DHASH_SIZE
+DEFAULT_SIMILARITY_PCT = 60
+
+
+def clamp_similarity_pct(value: object, default: int = DEFAULT_SIMILARITY_PCT) -> int:
+    try:
+        pct = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        pct = default
+    return max(1, min(99, pct))
+
+
+def similarity_pct_to_threshold(pct: int, bits: int = DHASH_BITS) -> int:
+    """相似度 >= pct 視為像待命。60% → 最多可差約 25/64。"""
+    pct = clamp_similarity_pct(pct)
+    return max(0, bits - math.ceil(bits * pct / 100))
+
+
+def hash_similarity_pct(dist: int, bits: int = DHASH_BITS) -> int:
+    return max(0, min(100, int(round((bits - dist) * 100 / bits))))
+
+
+def dhash_int(image: Image.Image, hash_size: int = DHASH_SIZE) -> int:
     gray = image.convert("L").resize(
         (hash_size + 1, hash_size), Image.Resampling.LANCZOS
     )
@@ -272,6 +296,7 @@ class ChannelPref:
     notify_live: bool = True
     notify_start: bool = True
     display_name: str = ""
+    similarity_pct: int = DEFAULT_SIMILARITY_PCT
 
 
 def watchlist_path() -> str:
@@ -341,6 +366,9 @@ def load_channel_prefs() -> list[ChannelPref]:
                         notify_live=bool(item.get("notify_live", True)),
                         notify_start=bool(item.get("notify_start", True)),
                         display_name=str(item.get("display_name") or ""),
+                        similarity_pct=clamp_similarity_pct(
+                            item.get("similarity_pct", DEFAULT_SIMILARITY_PCT)
+                        ),
                     )
                 )
         if prefs:
@@ -357,6 +385,7 @@ def save_channel_prefs(prefs: list[ChannelPref]) -> None:
             "notify_live": pref.notify_live,
             "notify_start": pref.notify_start,
             "display_name": pref.display_name,
+            "similarity_pct": clamp_similarity_pct(pref.similarity_pct),
         }
         for pref in prefs
         if pref.login
@@ -1299,13 +1328,18 @@ async def monitor_broadcast(
     stop_event: asyncio.Event,
     *,
     already_live: bool,
+    pref: ChannelPref | None = None,
 ) -> bool:
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         log("❌ 找不到 ffmpeg。請安裝 FFmpeg 並加入 PATH，或把 ffmpeg.exe 放到程式同一個資料夾。")
         return False
 
+    pref = pref or ChannelPref(login=broadcaster)
+    similarity_pct = clamp_similarity_pct(pref.similarity_pct)
+    threshold = similarity_pct_to_threshold(similarity_pct)
     refs, used = load_reference_hashes(settings.standby_dir, broadcaster)
+    log(f"🎯 [{broadcaster}] 像待命門檻 {similarity_pct}%（差 ≤ {threshold}/{DHASH_BITS}）")
     if used:
         log(f"🖼️ [{broadcaster}] 待命參考圖：{', '.join(os.path.basename(p) for p in used)}")
     elif already_live:
@@ -1341,6 +1375,8 @@ async def monitor_broadcast(
             frame_path,
             procs,
             refs,
+            threshold=threshold,
+            similarity_pct=similarity_pct,
         )
     except asyncio.CancelledError:
         raise
@@ -1503,8 +1539,11 @@ async def _watch_frames(
     frame_path: str,
     procs: list[asyncio.subprocess.Process],
     refs: list[int],
+    *,
+    threshold: int,
+    similarity_pct: int,
 ) -> bool:
-    detector = StandbyDetector(refs, settings.hash_threshold, settings.confirm_frames)
+    detector = StandbyDetector(refs, threshold, settings.confirm_frames)
     started = time.monotonic()
     last_sig: tuple[float, int] | None = None
     recent: list[int] = []
@@ -1561,7 +1600,7 @@ async def _watch_frames(
             if not detector.references:
                 recent.append(frame_hash)
                 recent = recent[-5:]
-                if hashes_are_stable(recent, settings.hash_threshold):
+                if hashes_are_stable(recent, threshold):
                     detector.set_references(recent[-3:])
                     log(f"📌 [{login}] 已建立穩定待命 baseline")
                     stable_logged = True
@@ -1574,19 +1613,23 @@ async def _watch_frames(
                 continue
 
             state, dist = detector.observe(frame_hash)
-            bits = 64
+            bits = DHASH_BITS
             if dist is None:
                 continue
+            sim = hash_similarity_pct(dist, bits)
             if state == "standby":
                 standby_logs += 1
                 if standby_logs == 1 or standby_logs % 10 == 0:
-                    log(f"[{login}] 與待命差 {dist}/{bits}（像待命）")
+                    log(f"[{login}] 與待命相似度 {sim}%（門檻 {similarity_pct}%，差 {dist}/{bits}）像待命")
             elif state == "pending":
                 log(
-                    f"[{login}] 與待命差 {dist}/{bits}（不像 {detector.unlike_streak}/{settings.confirm_frames}）"
+                    f"[{login}] 與待命相似度 {sim}%（門檻 {similarity_pct}%，差 {dist}/{bits}）"
+                    f"不像 {detector.unlike_streak}/{settings.confirm_frames}"
                 )
             else:
-                log(f"🚨🚨 [{login}] 畫面已離開待命（差 {dist}/{bits}），正片開始！")
+                log(
+                    f"🚨🚨 [{login}] 畫面已離開待命（相似度 {sim}%／門檻 {similarity_pct}%），正片開始！"
+                )
                 return True
         return False
     finally:
@@ -1630,7 +1673,7 @@ async def _kill_all(procs: list[asyncio.subprocess.Process]) -> None:
 
 # === app ===
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"
 
 
 class ChannelRow:
@@ -1688,6 +1731,23 @@ class ChannelRow:
         )
         self.start_chk.pack(side=tk.LEFT, padx=(0, 8))
 
+        tk.Label(self.frame, text="像", bg=PANEL, fg=MUTED, font=FONT).pack(side=tk.LEFT)
+        self.similarity_var = tk.StringVar(value=str(pref.similarity_pct))
+        self.similarity_spin = tk.Spinbox(
+            self.frame,
+            from_=1,
+            to=99,
+            width=3,
+            textvariable=self.similarity_var,
+            font=FONT,
+            command=self.app._persist_watchlist,
+        )
+        self.similarity_spin.pack(side=tk.LEFT)
+        tk.Label(self.frame, text="%", bg=PANEL, fg=MUTED, font=FONT).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        self.similarity_var.trace_add("write", lambda *_: self.app._persist_watchlist())
+
         self.status = tk.Label(
             self.frame, text="", anchor="w", width=18, bg=PANEL, font=FONT
         )
@@ -1716,6 +1776,7 @@ class ChannelRow:
             notify_live=bool(self.notify_live_var.get()),
             notify_start=bool(self.notify_start_var.get()),
             display_name=self._saved_display_name(),
+            similarity_pct=clamp_similarity_pct(self.similarity_var.get()),
         )
 
     def _saved_display_name(self) -> str:
@@ -1764,6 +1825,7 @@ class ChannelRow:
         state = tk.NORMAL if enabled else tk.DISABLED
         for widget in (
             self.entry,
+            self.similarity_spin,
             self.img_btn,
             self.vid_btn,
             self.clear_btn,
@@ -1892,7 +1954,7 @@ class StreamMonitorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(f"實況守門員 主控台 V{__version__}")
-        self.root.geometry("920x720")
+        self.root.geometry("1020x720")
         apply_root(root)
         self._apply_icon()
 
@@ -1927,7 +1989,7 @@ class StreamMonitorApp:
         watch.pack(fill=tk.X, padx=14, pady=6)
         label(
             watch,
-            "每台可分開開關「開台通知」與「開始通知」，並指定待命圖片或影片。",
+            "每台可調「像待命」相似度（預設 60%），並指定待命圖片或影片。",
         ).pack(fill=tk.X, pady=(0, 6))
         add_row = tk.Frame(watch, bg=PANEL)
         add_row.pack(fill=tk.X, pady=(0, 6))
@@ -2411,6 +2473,7 @@ class StreamMonitorApp:
                     self.log,
                     stop_event,
                     already_live=already_live,
+                    pref=self._active_prefs.get(login) or ChannelPref(login=login),
                 )
             if started and not stop_event.is_set():
                 pref = self._active_prefs.get(login) or ChannelPref(login=login)
