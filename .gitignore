@@ -11,6 +11,10 @@ env/
 .vscode/
 .env
 twitch_token.json
+watchlist.txt
+ffmpeg.exe
+ffprobe.exe
+ffplay.exe
 打包成品_*/
 build/
 dist/

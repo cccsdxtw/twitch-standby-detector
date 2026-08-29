@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 
 from dotenv import load_dotenv
 
@@ -29,16 +30,84 @@ class Settings:
     def ready_for_eventsub(self) -> bool:
         return bool(self.twitch_client_id) and not self.simulate
 
+    def with_logins(self, logins: tuple[str, ...]) -> Settings:
+        return replace(self, user_logins=logins)
+
+
+def watchlist_path() -> str:
+    return os.path.join(app_dir(), "watchlist.txt")
+
+
+def normalize_login(item: str) -> str:
+    login = item.strip().lower().rstrip("/")
+    if "twitch.tv/" in login:
+        login = login.split("twitch.tv/", 1)[1]
+        login = login.split("?", 1)[0].split("/", 1)[0]
+    return login
+
 
 def parse_logins(raw: str) -> tuple[str, ...]:
     parts = []
     seen = set()
-    for item in raw.replace(";", ",").split(","):
-        login = item.strip().lower()
+    for item in re.split(r"[,;\s]+", raw):
+        login = normalize_login(item)
         if login and login not in seen:
             seen.add(login)
             parts.append(login)
     return tuple(parts)
+
+
+def load_watchlist_text() -> str:
+    path = watchlist_path()
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def save_watchlist(logins: tuple[str, ...]) -> None:
+    with open(watchlist_path(), "w", encoding="utf-8") as handle:
+        handle.write("\n".join(logins))
+        if logins:
+            handle.write("\n")
+
+
+def env_path() -> str:
+    return os.path.join(app_dir(), ".env")
+
+
+def upsert_env_values(values: dict[str, str]) -> None:
+    """更新 .env 指定鍵，其餘註解與項目原樣保留。"""
+    path = env_path()
+    lines: list[str] = []
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+
+    seen: set[str] = set()
+    updated: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            updated.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in values:
+            updated.append(f"{key}={values[key]}")
+            seen.add(key)
+        else:
+            updated.append(line)
+    for key, value in values.items():
+        if key not in seen:
+            updated.append(f"{key}={value}")
+
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("\n".join(updated))
+        handle.write("\n")
+    load_dotenv(path, override=True)
 
 
 def _truthy(value: str) -> bool:
@@ -66,11 +135,12 @@ def _env_int(name: str, default: int) -> int:
 
 
 def load_settings() -> Settings:
-    env_path = os.path.join(app_dir(), ".env")
-    load_dotenv(env_path, override=False)
+    load_dotenv(env_path(), override=True)
 
     simulate = _truthy(os.getenv("SIMULATE", "0"))
-    logins = parse_logins(os.getenv("TWITCH_USER_LOGINS", ""))
+    logins = parse_logins(load_watchlist_text()) or parse_logins(
+        os.getenv("TWITCH_USER_LOGINS", "")
+    )
     if simulate and not logins:
         logins = (DEFAULT_SIMULATE_LOGIN,)
 

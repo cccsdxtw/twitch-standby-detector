@@ -8,7 +8,14 @@ from types import SimpleNamespace
 from PIL import Image, ImageDraw
 
 from image_hash import dhash_int, hamming_distance
-from standby import StandbyDetector, hashes_are_stable, list_reference_files, load_reference_hashes
+from standby import (
+    StandbyDetector,
+    describe_references,
+    hashes_are_stable,
+    import_standby_image,
+    list_reference_files,
+    load_reference_hashes,
+)
 from twitch_stream import pick_stream, parse_height
 
 
@@ -70,6 +77,15 @@ class ReferenceFilesTests(unittest.TestCase):
             found = list_reference_files(tmp, "LanMeiNotBeer")
             names = {os.path.basename(p) for p in found}
             self.assertEqual(names, {"lanmeinotbeer.png", "lanmeinotbeer-2.jpg"})
+
+    def test_import_image_saves_png(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src.jpg")
+            Image.new("RGB", (32, 32), "blue").save(src)
+            dest_dir = os.path.join(tmp, "standby")
+            files = import_standby_image(dest_dir, "Foo", src)
+            self.assertTrue(files[0].endswith("foo.png"))
+            self.assertEqual(describe_references(dest_dir, "foo"), "foo.png")
 
     def test_load_skips_empty_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
