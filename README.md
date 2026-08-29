@@ -1,6 +1,6 @@
 # 實況守門員
 
-Twitch 待命畫面 / 正片切換監控。版本 **v0.3.0**。版本號避開 4（下一版為 **v0.5.0**，不發 v0.4.0）。
+Twitch 待命畫面 / 正片切換監控。版本 **v0.5.0**。版本號避開 4。
 
 桌面程式：Tkinter + 背景 asyncio。EventSub 聽開台／下播，streamlink + FFmpeg 抽幀，dHash 比對待命畫面，正片開始後打 Discord Webhook。
 
@@ -13,10 +13,9 @@ Twitch 待命畫面 / 正片切換監控。版本 **v0.3.0**。版本號避開 4
 
 ## 設定
 
-1. 複製 `.env.example` 為 `.env`（與 `app.py` 同層；打包後與 EXE 同層）。
-2. [Twitch Developer Console](https://dev.twitch.tv/console) 建立應用，填 `TWITCH_CLIENT_ID`。Redirect URL 可填 `http://localhost`。第一次啟動會 Device Code 登入，token 存 `twitch_token.json`。
-3. `TWITCH_USER_LOGINS` 填頻道（逗號分隔）。
-4. 可選 `DISCORD_WEBHOOK_URL`。
+1. 打開程式後按 **「設定 ID / 網址」**，填 Twitch Client ID 與 Discord Webhook（存在本機 `.env`）。
+2. [Twitch Developer Console](https://dev.twitch.tv/console) 建立應用。Redirect URL 可填 `http://localhost`。第一次啟動會 Device Code 登入，token 存 `twitch_token.json`。
+3. 視窗裡新增頻道。每台可「選圖片」或「選影片」當待命樣本。建議一次不要超過 5 台。
 5. **強烈建議**把待命截圖放到 `standby/<登入名>.png`（例如 `standby/lanmeinotbeer.png`）。沒有參考圖時：剛開台會試著抓穩定 baseline；**啟動時已經在直播則略過判定**。
 6. 沒憑證試 UI：`SIMULATE=1`。
 

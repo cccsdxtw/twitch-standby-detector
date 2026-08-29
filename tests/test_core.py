@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from config import parse_logins
+from config import parse_logins, upsert_env_values
 from discord_notify import build_webhook_body
 from paths import app_dir, get_resource_path
 from twitch_eventsub import event_from_notification, parse_ws_message
@@ -22,6 +22,33 @@ class ParseLoginsTests(unittest.TestCase):
 
     def test_empty(self) -> None:
         self.assertEqual(parse_logins("  ,  "), ())
+
+    def test_newlines_and_urls(self) -> None:
+        self.assertEqual(
+            parse_logins("https://www.twitch.tv/Foo\nbar, baz"),
+            ("foo", "bar", "baz"),
+        )
+
+
+class EnvUpsertTests(unittest.TestCase):
+    def test_updates_and_keeps_comments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".env")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("# keep\nTWITCH_CLIENT_ID=old\nSIMULATE=0\n")
+            with mock.patch("config.app_dir", return_value=tmp):
+                upsert_env_values(
+                    {
+                        "TWITCH_CLIENT_ID": "newid",
+                        "DISCORD_WEBHOOK_URL": "https://example.com/hook",
+                    }
+                )
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+        self.assertIn("# keep", text)
+        self.assertIn("TWITCH_CLIENT_ID=newid", text)
+        self.assertIn("SIMULATE=0", text)
+        self.assertIn("DISCORD_WEBHOOK_URL=https://example.com/hook", text)
 
 
 class PathsTests(unittest.TestCase):
