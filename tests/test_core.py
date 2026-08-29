@@ -6,11 +6,22 @@ import tempfile
 import unittest
 from unittest import mock
 
-from config import parse_logins, upsert_env_values
-from discord_notify import build_webhook_body
-from paths import app_dir, get_resource_path
-from twitch_eventsub import event_from_notification, parse_ws_message
-from twitch_oauth import TokenPair, token_from_response
+from app import (
+    ChannelPref,
+    TokenPair,
+    app_dir,
+    build_live_message,
+    build_start_message,
+    build_webhook_body,
+    event_from_notification,
+    get_resource_path,
+    load_channel_prefs,
+    parse_logins,
+    parse_ws_message,
+    save_channel_prefs,
+    token_from_response,
+    upsert_env_values,
+)
 
 
 class ParseLoginsTests(unittest.TestCase):
@@ -36,7 +47,7 @@ class EnvUpsertTests(unittest.TestCase):
             path = os.path.join(tmp, ".env")
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write("# keep\nTWITCH_CLIENT_ID=old\nSIMULATE=0\n")
-            with mock.patch("config.app_dir", return_value=tmp):
+            with mock.patch("app.app_dir", return_value=tmp):
                 upsert_env_values(
                     {
                         "TWITCH_CLIENT_ID": "newid",
@@ -96,6 +107,43 @@ class DiscordTests(unittest.TestCase):
         body = build_webhook_body("x" * 3000)
         self.assertEqual(len(body["content"]), 2000)
 
+    def test_live_message_format(self) -> None:
+        self.assertEqual(
+            build_live_message("貓辣妹", "maoramei"),
+            "「貓辣妹」在實況了\n來去 https://www.twitch.tv/maoramei 看看",
+        )
+
+    def test_start_message_format(self) -> None:
+        self.assertEqual(
+            build_start_message("貓辣妹", "maoramei"),
+            "「貓辣妹」正片開始了\n來去 https://www.twitch.tv/maoramei 看看",
+        )
+
+
+class WatchlistPrefTests(unittest.TestCase):
+    def test_roundtrip_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("app.app_dir", return_value=tmp):
+                save_channel_prefs(
+                    [
+                        ChannelPref(
+                            "maoramei",
+                            notify_live=True,
+                            notify_start=False,
+                            display_name="貓辣妹",
+                        ),
+                        ChannelPref("lanmeinotbeer", notify_live=False, notify_start=True),
+                    ]
+                )
+                prefs = load_channel_prefs()
+        self.assertEqual(prefs[0].login, "maoramei")
+        self.assertEqual(prefs[0].display_name, "貓辣妹")
+        self.assertTrue(prefs[0].notify_live)
+        self.assertFalse(prefs[0].notify_start)
+        self.assertFalse(prefs[1].notify_live)
+        self.assertTrue(prefs[1].notify_start)
+        self.assertEqual(prefs[1].display_name, "")
+
 
 class TokenTests(unittest.TestCase):
     def test_from_response_sets_expiry(self) -> None:
@@ -110,11 +158,11 @@ class TokenTests(unittest.TestCase):
         self.assertFalse(pair.access_valid())
 
     def test_save_and_load_roundtrip(self) -> None:
-        from twitch_oauth import load_token, save_token, token_path
+        from app import load_token, save_token, token_path
 
         pair = TokenPair(access_token="tok", refresh_token="ref", expires_at=9999999999)
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch("twitch_oauth.app_dir", return_value=tmp):
+            with mock.patch("app.app_dir", return_value=tmp):
                 save_token(pair)
                 self.assertTrue(os.path.isfile(token_path()))
                 loaded = load_token()
