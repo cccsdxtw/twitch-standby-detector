@@ -13,12 +13,15 @@ from app import (
     build_live_message,
     build_start_message,
     build_webhook_body,
+    clamp_similarity_pct,
     event_from_notification,
     get_resource_path,
     load_channel_prefs,
+    parse_ignore_color,
     parse_logins,
     parse_ws_message,
     save_channel_prefs,
+    similarity_pct_to_threshold,
     token_from_response,
     upsert_env_values,
 )
@@ -131,6 +134,9 @@ class WatchlistPrefTests(unittest.TestCase):
                             notify_live=True,
                             notify_start=False,
                             display_name="貓辣妹",
+                            similarity_pct=70,
+                            ignore_color="#ffffff",
+                            ignore_tolerance=35,
                         ),
                         ChannelPref("lanmeinotbeer", notify_live=False, notify_start=True),
                     ]
@@ -143,6 +149,24 @@ class WatchlistPrefTests(unittest.TestCase):
         self.assertFalse(prefs[1].notify_live)
         self.assertTrue(prefs[1].notify_start)
         self.assertEqual(prefs[1].display_name, "")
+        self.assertEqual(prefs[0].similarity_pct, 70)
+        self.assertEqual(prefs[0].ignore_color, "#ffffff")
+        self.assertEqual(prefs[0].ignore_tolerance, 35)
+        self.assertEqual(prefs[1].similarity_pct, 60)
+
+
+class SimilarityTests(unittest.TestCase):
+    def test_default_sixty_percent(self) -> None:
+        self.assertEqual(similarity_pct_to_threshold(60), 25)
+
+    def test_clamp(self) -> None:
+        self.assertEqual(clamp_similarity_pct("0"), 1)
+        self.assertEqual(clamp_similarity_pct("200"), 99)
+        self.assertEqual(clamp_similarity_pct("x"), 60)
+
+    def test_parse_color(self) -> None:
+        self.assertEqual(parse_ignore_color("#ff00aa"), (255, 0, 170))
+        self.assertIsNone(parse_ignore_color(""))
 
 
 class TokenTests(unittest.TestCase):

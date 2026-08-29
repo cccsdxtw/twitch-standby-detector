@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import queue
 import re
@@ -23,7 +24,7 @@ import httpx
 import tkinter as tk
 from dotenv import load_dotenv
 from PIL import Image, UnidentifiedImageError
-from tkinter import filedialog, scrolledtext
+from tkinter import colorchooser, filedialog, scrolledtext
 
 
 # === ui_theme.py ===
@@ -168,8 +169,90 @@ def get_resource_path(relative_path: str) -> str:
 from PIL import Image
 
 
-def dhash_int(image: Image.Image, hash_size: int = 8) -> int:
-    gray = image.convert("L").resize(
+DHASH_SIZE = 8
+DHASH_BITS = DHASH_SIZE * DHASH_SIZE
+DEFAULT_SIMILARITY_PCT = 60
+DEFAULT_IGNORE_TOLERANCE = 40
+
+
+def clamp_similarity_pct(value: object, default: int = DEFAULT_SIMILARITY_PCT) -> int:
+    try:
+        pct = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        pct = default
+    return max(1, min(99, pct))
+
+
+def clamp_ignore_tolerance(value: object, default: int = DEFAULT_IGNORE_TOLERANCE) -> int:
+    try:
+        tol = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        tol = default
+    return max(0, min(120, tol))
+
+
+def similarity_pct_to_threshold(pct: int, bits: int = DHASH_BITS) -> int:
+    """相似度 >= pct 視為像待命。60% → 最多可差約 25/64。"""
+    pct = clamp_similarity_pct(pct)
+    return max(0, bits - math.ceil(bits * pct / 100))
+
+
+def hash_similarity_pct(dist: int, bits: int = DHASH_BITS) -> int:
+    return max(0, min(100, int(round((bits - dist) * 100 / bits))))
+
+
+def parse_ignore_color(text: str) -> tuple[int, int, int] | None:
+    raw = (text or "").strip().lstrip("#")
+    if len(raw) != 6:
+        return None
+    try:
+        return int(raw[0:2], 16), int(raw[2:4], 16), int(raw[4:6], 16)
+    except ValueError:
+        return None
+
+
+def format_ignore_color(color: tuple[int, int, int]) -> str:
+    return f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}"
+
+
+def apply_ignore_color(
+    image: Image.Image,
+    color: tuple[int, int, int] | None,
+    tolerance: int = DEFAULT_IGNORE_TOLERANCE,
+) -> Image.Image:
+    """略過色的像素改填未略過區域的平均色，標題改字就比較不會動到 hash。"""
+    rgb = image.convert("RGB")
+    if color is None:
+        return rgb
+    pixels = list(rgb.getdata())
+    cr, cg, cb = color
+    tol = clamp_ignore_tolerance(tolerance)
+    mask: list[bool] = []
+    kept: list[tuple[int, int, int]] = []
+    for r, g, b in pixels:
+        skip = max(abs(r - cr), abs(g - cg), abs(b - cb)) <= tol
+        mask.append(skip)
+        if not skip:
+            kept.append((r, g, b))
+    if not kept or all(mask):
+        return rgb
+    fill = (
+        sum(p[0] for p in kept) // len(kept),
+        sum(p[1] for p in kept) // len(kept),
+        sum(p[2] for p in kept) // len(kept),
+    )
+    rgb.putdata([fill if skip else px for skip, px in zip(mask, pixels)])
+    return rgb
+
+
+def dhash_int(
+    image: Image.Image,
+    hash_size: int = DHASH_SIZE,
+    ignore_color: tuple[int, int, int] | None = None,
+    ignore_tolerance: int = DEFAULT_IGNORE_TOLERANCE,
+) -> int:
+    prepared = apply_ignore_color(image, ignore_color, ignore_tolerance)
+    gray = prepared.convert("L").resize(
         (hash_size + 1, hash_size), Image.Resampling.LANCZOS
     )
     pixels = list(gray.getdata())
@@ -272,6 +355,9 @@ class ChannelPref:
     notify_live: bool = True
     notify_start: bool = True
     display_name: str = ""
+    similarity_pct: int = DEFAULT_SIMILARITY_PCT
+    ignore_color: str = ""
+    ignore_tolerance: int = DEFAULT_IGNORE_TOLERANCE
 
 
 def watchlist_path() -> str:
@@ -341,6 +427,13 @@ def load_channel_prefs() -> list[ChannelPref]:
                         notify_live=bool(item.get("notify_live", True)),
                         notify_start=bool(item.get("notify_start", True)),
                         display_name=str(item.get("display_name") or ""),
+                        similarity_pct=clamp_similarity_pct(
+                            item.get("similarity_pct", DEFAULT_SIMILARITY_PCT)
+                        ),
+                        ignore_color=str(item.get("ignore_color") or ""),
+                        ignore_tolerance=clamp_ignore_tolerance(
+                            item.get("ignore_tolerance", DEFAULT_IGNORE_TOLERANCE)
+                        ),
                     )
                 )
         if prefs:
@@ -357,6 +450,9 @@ def save_channel_prefs(prefs: list[ChannelPref]) -> None:
             "notify_live": pref.notify_live,
             "notify_start": pref.notify_start,
             "display_name": pref.display_name,
+            "similarity_pct": clamp_similarity_pct(pref.similarity_pct),
+            "ignore_color": pref.ignore_color,
+            "ignore_tolerance": clamp_ignore_tolerance(pref.ignore_tolerance),
         }
         for pref in prefs
         if pref.login
@@ -530,14 +626,25 @@ def list_reference_files(standby_dir: str, login: str) -> list[str]:
     return found
 
 
-def load_reference_hashes(standby_dir: str, login: str) -> tuple[list[int], list[str]]:
+def load_reference_hashes(
+    standby_dir: str,
+    login: str,
+    ignore_color: tuple[int, int, int] | None = None,
+    ignore_tolerance: int = DEFAULT_IGNORE_TOLERANCE,
+) -> tuple[list[int], list[str]]:
     hashes: list[int] = []
     used: list[str] = []
     for path in list_reference_files(standby_dir, login):
         try:
             with Image.open(path) as img:
                 img.load()
-                hashes.append(dhash_int(img))
+                hashes.append(
+                    dhash_int(
+                        img,
+                        ignore_color=ignore_color,
+                        ignore_tolerance=ignore_tolerance,
+                    )
+                )
             used.append(path)
         except (OSError, UnidentifiedImageError):
             continue
@@ -1299,13 +1406,29 @@ async def monitor_broadcast(
     stop_event: asyncio.Event,
     *,
     already_live: bool,
+    pref: ChannelPref | None = None,
 ) -> bool:
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         log("❌ 找不到 ffmpeg。請安裝 FFmpeg 並加入 PATH，或把 ffmpeg.exe 放到程式同一個資料夾。")
         return False
 
-    refs, used = load_reference_hashes(settings.standby_dir, broadcaster)
+    pref = pref or ChannelPref(login=broadcaster)
+    ignore_color = parse_ignore_color(pref.ignore_color)
+    ignore_tolerance = clamp_ignore_tolerance(pref.ignore_tolerance)
+    similarity_pct = clamp_similarity_pct(pref.similarity_pct)
+    threshold = similarity_pct_to_threshold(similarity_pct)
+    refs, used = load_reference_hashes(
+        settings.standby_dir,
+        broadcaster,
+        ignore_color=ignore_color,
+        ignore_tolerance=ignore_tolerance,
+    )
+    log(f"🎯 [{broadcaster}] 像待命門檻 {similarity_pct}%（差 ≤ {threshold}/{DHASH_BITS}）")
+    if ignore_color:
+        log(
+            f"🎨 [{broadcaster}] 略過顏色 {format_ignore_color(ignore_color)}，容差 {ignore_tolerance}"
+        )
     if used:
         log(f"🖼️ [{broadcaster}] 待命參考圖：{', '.join(os.path.basename(p) for p in used)}")
     elif already_live:
@@ -1341,6 +1464,10 @@ async def monitor_broadcast(
             frame_path,
             procs,
             refs,
+            threshold=threshold,
+            similarity_pct=similarity_pct,
+            ignore_color=ignore_color,
+            ignore_tolerance=ignore_tolerance,
         )
     except asyncio.CancelledError:
         raise
@@ -1503,8 +1630,13 @@ async def _watch_frames(
     frame_path: str,
     procs: list[asyncio.subprocess.Process],
     refs: list[int],
+    *,
+    threshold: int,
+    similarity_pct: int,
+    ignore_color: tuple[int, int, int] | None,
+    ignore_tolerance: int,
 ) -> bool:
-    detector = StandbyDetector(refs, settings.hash_threshold, settings.confirm_frames)
+    detector = StandbyDetector(refs, threshold, settings.confirm_frames)
     started = time.monotonic()
     last_sig: tuple[float, int] | None = None
     recent: list[int] = []
@@ -1547,7 +1679,11 @@ async def _watch_frames(
             try:
                 with Image.open(frame_path) as img:
                     img.load()
-                    frame_hash = dhash_int(img)
+                    frame_hash = dhash_int(
+                        img,
+                        ignore_color=ignore_color,
+                        ignore_tolerance=ignore_tolerance,
+                    )
             except (OSError, UnidentifiedImageError):
                 continue
 
@@ -1561,7 +1697,7 @@ async def _watch_frames(
             if not detector.references:
                 recent.append(frame_hash)
                 recent = recent[-5:]
-                if hashes_are_stable(recent, settings.hash_threshold):
+                if hashes_are_stable(recent, threshold):
                     detector.set_references(recent[-3:])
                     log(f"📌 [{login}] 已建立穩定待命 baseline")
                     stable_logged = True
@@ -1574,19 +1710,23 @@ async def _watch_frames(
                 continue
 
             state, dist = detector.observe(frame_hash)
-            bits = 64
+            bits = DHASH_BITS
             if dist is None:
                 continue
+            sim = hash_similarity_pct(dist, bits)
             if state == "standby":
                 standby_logs += 1
                 if standby_logs == 1 or standby_logs % 10 == 0:
-                    log(f"[{login}] 與待命差 {dist}/{bits}（像待命）")
+                    log(f"[{login}] 與待命相似度 {sim}%（門檻 {similarity_pct}%，差 {dist}/{bits}）像待命")
             elif state == "pending":
                 log(
-                    f"[{login}] 與待命差 {dist}/{bits}（不像 {detector.unlike_streak}/{settings.confirm_frames}）"
+                    f"[{login}] 與待命相似度 {sim}%（門檻 {similarity_pct}%，差 {dist}/{bits}）"
+                    f"不像 {detector.unlike_streak}/{settings.confirm_frames}"
                 )
             else:
-                log(f"🚨🚨 [{login}] 畫面已離開待命（差 {dist}/{bits}），正片開始！")
+                log(
+                    f"🚨🚨 [{login}] 畫面已離開待命（相似度 {sim}%／門檻 {similarity_pct}%），正片開始！"
+                )
                 return True
         return False
     finally:
@@ -1630,7 +1770,7 @@ async def _kill_all(procs: list[asyncio.subprocess.Process]) -> None:
 
 # === app ===
 
-__version__ = "0.6.1"
+__version__ = "0.8.0"
 
 
 class ChannelRow:
@@ -1688,6 +1828,52 @@ class ChannelRow:
         )
         self.start_chk.pack(side=tk.LEFT, padx=(0, 8))
 
+        tk.Label(self.frame, text="像", bg=PANEL, fg=MUTED, font=FONT).pack(side=tk.LEFT)
+        self.similarity_var = tk.StringVar(value=str(pref.similarity_pct))
+        self.similarity_spin = tk.Spinbox(
+            self.frame,
+            from_=1,
+            to=99,
+            width=3,
+            textvariable=self.similarity_var,
+            font=FONT,
+            command=self.app._persist_watchlist,
+        )
+        self.similarity_spin.pack(side=tk.LEFT)
+        tk.Label(self.frame, text="%", bg=PANEL, fg=MUTED, font=FONT).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        self.similarity_var.trace_add("write", lambda *_: self.app._persist_watchlist())
+
+        self.ignore_color = pref.ignore_color.strip()
+        self.ignore_tol_var = tk.StringVar(value=str(pref.ignore_tolerance))
+        self.color_swatch = tk.Label(
+            self.frame,
+            text="  ",
+            width=2,
+            relief=tk.SOLID,
+            bd=1,
+            bg=PANEL,
+        )
+        self.color_swatch.pack(side=tk.LEFT, padx=(0, 2))
+        self.color_btn = small_button(self.frame, "略過色", self._pick_ignore_color, ORANGE)
+        self.color_btn.pack(side=tk.LEFT, padx=2)
+        self.clear_color_btn = small_button(self.frame, "清色", self._clear_ignore_color, GRAY)
+        self.clear_color_btn.pack(side=tk.LEFT, padx=2)
+        tk.Label(self.frame, text="容差", bg=PANEL, fg=MUTED, font=FONT).pack(side=tk.LEFT)
+        self.ignore_tol_spin = tk.Spinbox(
+            self.frame,
+            from_=0,
+            to=120,
+            width=3,
+            textvariable=self.ignore_tol_var,
+            font=FONT,
+            command=self.app._persist_watchlist,
+        )
+        self.ignore_tol_spin.pack(side=tk.LEFT, padx=(0, 8))
+        self.ignore_tol_var.trace_add("write", lambda *_: self.app._persist_watchlist())
+        self._refresh_swatch()
+
         self.status = tk.Label(
             self.frame, text="", anchor="w", width=18, bg=PANEL, font=FONT
         )
@@ -1716,6 +1902,9 @@ class ChannelRow:
             notify_live=bool(self.notify_live_var.get()),
             notify_start=bool(self.notify_start_var.get()),
             display_name=self._saved_display_name(),
+            similarity_pct=clamp_similarity_pct(self.similarity_var.get()),
+            ignore_color=self.ignore_color,
+            ignore_tolerance=clamp_ignore_tolerance(self.ignore_tol_var.get()),
         )
 
     def _saved_display_name(self) -> str:
@@ -1764,12 +1953,38 @@ class ChannelRow:
         state = tk.NORMAL if enabled else tk.DISABLED
         for widget in (
             self.entry,
+            self.similarity_spin,
+            self.color_btn,
+            self.clear_color_btn,
+            self.ignore_tol_spin,
             self.img_btn,
             self.vid_btn,
             self.clear_btn,
             self.remove_btn,
         ):
             widget.config(state=state)
+
+    def _refresh_swatch(self) -> None:
+        color = parse_ignore_color(self.ignore_color)
+        self.color_swatch.config(bg=self.ignore_color if color else PANEL)
+
+    def _pick_ignore_color(self) -> None:
+        initial = self.ignore_color if parse_ignore_color(self.ignore_color) else "#ffffff"
+        _rgb, hexcol = colorchooser.askcolor(color=initial, title="選要略過比較的顏色（標題字等）")
+        if not hexcol:
+            return
+        self.ignore_color = str(hexcol)
+        self._refresh_swatch()
+        self.app._persist_watchlist()
+        self.app.log(f"🎨 [{self.login() or '?'}] 略過顏色 {self.ignore_color}")
+
+    def _clear_ignore_color(self) -> None:
+        if not self.ignore_color:
+            return
+        self.ignore_color = ""
+        self._refresh_swatch()
+        self.app._persist_watchlist()
+        self.app.log(f"🎨 [{self.login() or '?'}] 已取消略過顏色")
 
     def _pick_image(self) -> None:
         name = self.login()
@@ -1892,7 +2107,7 @@ class StreamMonitorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(f"實況守門員 主控台 V{__version__}")
-        self.root.geometry("920x720")
+        self.root.geometry("1180x720")
         apply_root(root)
         self._apply_icon()
 
@@ -1927,7 +2142,7 @@ class StreamMonitorApp:
         watch.pack(fill=tk.X, padx=14, pady=6)
         label(
             watch,
-            "每台可分開開關「開台通知」與「開始通知」，並指定待命圖片或影片。",
+            "每台可調「像待命」相似度（預設 60%）、略過標題等會變的顏色，並指定待命圖片或影片。",
         ).pack(fill=tk.X, pady=(0, 6))
         add_row = tk.Frame(watch, bg=PANEL)
         add_row.pack(fill=tk.X, pady=(0, 6))
@@ -2411,6 +2626,7 @@ class StreamMonitorApp:
                     self.log,
                     stop_event,
                     already_live=already_live,
+                    pref=self._active_prefs.get(login) or ChannelPref(login=login),
                 )
             if started and not stop_event.is_set():
                 pref = self._active_prefs.get(login) or ChannelPref(login=login)

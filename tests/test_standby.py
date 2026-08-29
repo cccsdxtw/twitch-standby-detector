@@ -98,6 +98,26 @@ class ReferenceFilesTests(unittest.TestCase):
             self.assertTrue(used[0].endswith("foo.png"))
 
 
+class IgnoreColorTests(unittest.TestCase):
+    def _card(self, title: tuple[int, int, int]) -> Image.Image:
+        img = Image.new("RGB", (128, 128), (12, 16, 40))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([6, 6, 122, 28], fill=title)
+        draw.ellipse([44, 52, 84, 92], fill="red")
+        return img
+
+    def test_ignore_title_color_keeps_same_layout_close(self) -> None:
+        a = self._card((255, 255, 255))
+        b = self._card((230, 230, 210))
+        raw = hamming_distance(dhash_int(a), dhash_int(b))
+        masked = hamming_distance(
+            dhash_int(a, ignore_color=(255, 255, 255), ignore_tolerance=50),
+            dhash_int(b, ignore_color=(255, 255, 255), ignore_tolerance=50),
+        )
+        self.assertLessEqual(masked, raw)
+        self.assertLessEqual(masked, 6)
+
+
 class PickStreamTests(unittest.TestCase):
     def test_parse_height(self) -> None:
         self.assertEqual(parse_height("480p60"), 480)
