@@ -24,9 +24,16 @@ from app import (
     load_channel_prefs,
     parse_ignore_color,
     parse_logins,
+    plan_eventsub,
+    eventsub_cost,
+    describe_eventsub_plan,
     parse_ws_message,
     prepare_avatar_image,
     save_channel_prefs,
+    twitch_channel_url,
+    cdp_close_tab_url,
+    cdp_new_tab_url,
+    parse_cdp_target_id,
     similarity_pct_to_threshold,
     token_from_response,
     twitch_user_from_helix,
@@ -112,6 +119,19 @@ class EventSubParseTests(unittest.TestCase):
         self.assertEqual(event_type, "stream.online")
         self.assertEqual(event["broadcaster_user_login"], "lanmeinotbeer")
 
+    def test_notification_offline(self) -> None:
+        raw = {
+            "metadata": {"message_type": "notification"},
+            "payload": {
+                "subscription": {"type": "stream.offline"},
+                "event": {"broadcaster_user_login": "maoramei"},
+            },
+        }
+        _msg_type, data = parse_ws_message(json.dumps(raw))
+        event_type, event = event_from_notification(data)
+        self.assertEqual(event_type, "stream.offline")
+        self.assertEqual(event["broadcaster_user_login"], "maoramei")
+
 
 class DiscordTests(unittest.TestCase):
     def test_truncates_content(self) -> None:
@@ -141,6 +161,8 @@ class WatchlistPrefTests(unittest.TestCase):
                             "maoramei",
                             notify_live=True,
                             notify_start=False,
+                            open_watch=True,
+                            close_watch=True,
                             display_name="貓辣妹",
                             similarity_pct=70,
                             ignore_color="#ffffff",
@@ -154,13 +176,68 @@ class WatchlistPrefTests(unittest.TestCase):
         self.assertEqual(prefs[0].display_name, "貓辣妹")
         self.assertTrue(prefs[0].notify_live)
         self.assertFalse(prefs[0].notify_start)
+        self.assertTrue(prefs[0].open_watch)
+        self.assertTrue(prefs[0].close_watch)
+        self.assertFalse(prefs[1].open_watch)
+        self.assertFalse(prefs[1].close_watch)
         self.assertFalse(prefs[1].notify_live)
         self.assertTrue(prefs[1].notify_start)
+        self.assertFalse(prefs[1].open_watch)
         self.assertEqual(prefs[1].display_name, "")
         self.assertEqual(prefs[0].similarity_pct, 70)
         self.assertEqual(prefs[0].ignore_color, "#ffffff")
         self.assertEqual(prefs[0].ignore_tolerance, 35)
         self.assertEqual(prefs[1].similarity_pct, 60)
+
+    def test_open_watch_defaults_off(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "watchlist.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write('[{"login": "maoramei", "notify_live": true}]\n')
+            with mock.patch("app.app_dir", return_value=tmp):
+                prefs = load_channel_prefs()
+        self.assertFalse(prefs[0].open_watch)
+
+    def test_channel_url(self) -> None:
+        self.assertEqual(twitch_channel_url("MaoRamei"), "https://www.twitch.tv/maoramei")
+        self.assertEqual(twitch_channel_url(""), "")
+
+    def test_eventsub_plan_mixes_open_and_close(self) -> None:
+        prefs = [
+            ChannelPref("a", close_watch=True),
+            ChannelPref("b", close_watch=True),
+            ChannelPref("c"),
+            ChannelPref("d"),
+            ChannelPref("e", close_watch=True),
+            ChannelPref("f"),
+            ChannelPref("g"),
+            ChannelPref("h"),
+        ]
+        plan = plan_eventsub(prefs)
+        # 2+2+1+1+2+1+1 = 10, h needs 1 more → skip
+        self.assertEqual(plan.included, ("a", "b", "c", "d", "e", "f", "g"))
+        self.assertEqual(plan.skipped, ("h",))
+        self.assertEqual(plan.cost, 10)
+        self.assertEqual(eventsub_cost(ChannelPref("x")), 1)
+        self.assertEqual(eventsub_cost(ChannelPref("x", close_watch=True)), 2)
+        self.assertIn("可聽 7 台", describe_eventsub_plan(plan))
+        self.assertIn("10/10", describe_eventsub_plan(plan))
+
+    def test_eventsub_plan_ten_online_only(self) -> None:
+        prefs = [ChannelPref(f"u{i}") for i in range(12)]
+        plan = plan_eventsub(prefs)
+        self.assertEqual(len(plan.included), 10)
+        self.assertEqual(plan.skipped, ("u10", "u11"))
+        self.assertEqual(plan.cost, 10)
+
+    def test_cdp_urls_and_target_id(self) -> None:
+        self.assertIn(
+            "json/new?https%3A%2F%2Fwww.twitch.tv%2Fmaoramei",
+            cdp_new_tab_url("https://www.twitch.tv/maoramei"),
+        )
+        self.assertIn("json/close/abc-1", cdp_close_tab_url("abc-1"))
+        self.assertEqual(parse_cdp_target_id({"id": "tab-9"}), "tab-9")
+        self.assertEqual(parse_cdp_target_id({}), "")
 
 
 class SimilarityTests(unittest.TestCase):
