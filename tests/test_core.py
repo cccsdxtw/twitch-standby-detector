@@ -24,6 +24,9 @@ from app import (
     load_channel_prefs,
     parse_ignore_color,
     parse_logins,
+    plan_eventsub,
+    eventsub_cost,
+    describe_eventsub_plan,
     parse_ws_message,
     prepare_avatar_image,
     save_channel_prefs,
@@ -159,6 +162,7 @@ class WatchlistPrefTests(unittest.TestCase):
                             notify_live=True,
                             notify_start=False,
                             open_watch=True,
+                            close_watch=True,
                             display_name="貓辣妹",
                             similarity_pct=70,
                             ignore_color="#ffffff",
@@ -173,6 +177,9 @@ class WatchlistPrefTests(unittest.TestCase):
         self.assertTrue(prefs[0].notify_live)
         self.assertFalse(prefs[0].notify_start)
         self.assertTrue(prefs[0].open_watch)
+        self.assertTrue(prefs[0].close_watch)
+        self.assertFalse(prefs[1].open_watch)
+        self.assertFalse(prefs[1].close_watch)
         self.assertFalse(prefs[1].notify_live)
         self.assertTrue(prefs[1].notify_start)
         self.assertFalse(prefs[1].open_watch)
@@ -194,6 +201,34 @@ class WatchlistPrefTests(unittest.TestCase):
     def test_channel_url(self) -> None:
         self.assertEqual(twitch_channel_url("MaoRamei"), "https://www.twitch.tv/maoramei")
         self.assertEqual(twitch_channel_url(""), "")
+
+    def test_eventsub_plan_mixes_open_and_close(self) -> None:
+        prefs = [
+            ChannelPref("a", close_watch=True),
+            ChannelPref("b", close_watch=True),
+            ChannelPref("c"),
+            ChannelPref("d"),
+            ChannelPref("e", close_watch=True),
+            ChannelPref("f"),
+            ChannelPref("g"),
+            ChannelPref("h"),
+        ]
+        plan = plan_eventsub(prefs)
+        # 2+2+1+1+2+1+1 = 10, h needs 1 more → skip
+        self.assertEqual(plan.included, ("a", "b", "c", "d", "e", "f", "g"))
+        self.assertEqual(plan.skipped, ("h",))
+        self.assertEqual(plan.cost, 10)
+        self.assertEqual(eventsub_cost(ChannelPref("x")), 1)
+        self.assertEqual(eventsub_cost(ChannelPref("x", close_watch=True)), 2)
+        self.assertIn("可聽 7 台", describe_eventsub_plan(plan))
+        self.assertIn("10/10", describe_eventsub_plan(plan))
+
+    def test_eventsub_plan_ten_online_only(self) -> None:
+        prefs = [ChannelPref(f"u{i}") for i in range(12)]
+        plan = plan_eventsub(prefs)
+        self.assertEqual(len(plan.included), 10)
+        self.assertEqual(plan.skipped, ("u10", "u11"))
+        self.assertEqual(plan.cost, 10)
 
     def test_cdp_urls_and_target_id(self) -> None:
         self.assertIn(

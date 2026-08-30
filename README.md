@@ -15,13 +15,13 @@ Twitch 待命畫面 / 正片切換監控。版本 **v0.10.0**。版本號避開 
 
 1. 打開程式後按 **「設定 ID / 網址」**，填 Twitch Client ID 與 Discord Webhook（存在本機 `.env`）。
 2. [Twitch Developer Console](https://dev.twitch.tv/console) 建立應用。Redirect URL 可填 `http://localhost`。第一次啟動會 Device Code 登入，token 存 `twitch_token.json`。
-3. 視窗裡新增頻道。名稱前會顯示 Twitch 頭像；列太長可左右拖。每台可開關通知、勾「開網頁」（開台打開官方頁、關台關掉我們開的視窗）、調「像待命」相似度（預設 60%）、選略過色（標題等會變的區塊），並選待命圖片或影片。EventSub 同時聽開台與關台，即時約 5 台。
+3. 視窗裡新增頻道。名稱前會顯示 Twitch 頭像；列太長可左右拖。每台可開關通知、分開勾「開網頁／關網頁」、調「像待命」相似度（預設 60%）、選略過色（標題等會變的區塊），並選待命圖片或影片。視窗會依勾選算出 EventSub 預算（10）：只聽開台每台 1，再勾關網頁 +1。
 5. **強烈建議**把待命截圖放到 `standby/<登入名>.png`（例如 `standby/lanmeinotbeer.png`）。沒有參考圖時：剛開台會試著抓穩定 baseline；**啟動時已經在直播則略過判定**。
 6. 沒憑證試 UI：`SIMULATE=1`。
 
 可調：`FRAME_INTERVAL_SEC`（預設 3）、`AD_SKIP_SEC`（20）、`CONFIRM_FRAMES`（連續 4 張不像待命才通知）。每台的相似度與略過色存在 `watchlist.json`。
 
-EventSub 訂 `stream.online` 與 `stream.offline`（每台成本 2，即時約 5 台）。不做 Helix 輪詢。
+EventSub 預設只訂 `stream.online`（每台成本 1）。有勾關網頁的台才加 `stream.offline`。總預算 10，名單依序能塞多少聽多少。不做 Helix 輪詢。
 
 ## 執行
 

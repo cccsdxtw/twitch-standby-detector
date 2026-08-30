@@ -450,6 +450,7 @@ class ChannelPref:
     notify_live: bool = True
     notify_start: bool = True
     open_watch: bool = False
+    close_watch: bool = False
     display_name: str = ""
     similarity_pct: int = DEFAULT_SIMILARITY_PCT
     ignore_color: str = ""
@@ -523,6 +524,7 @@ def load_channel_prefs() -> list[ChannelPref]:
                         notify_live=bool(item.get("notify_live", True)),
                         notify_start=bool(item.get("notify_start", True)),
                         open_watch=bool(item.get("open_watch", False)),
+                        close_watch=bool(item.get("close_watch", False)),
                         display_name=str(item.get("display_name") or ""),
                         similarity_pct=clamp_similarity_pct(
                             item.get("similarity_pct", DEFAULT_SIMILARITY_PCT)
@@ -547,6 +549,7 @@ def save_channel_prefs(prefs: list[ChannelPref]) -> None:
             "notify_live": pref.notify_live,
             "notify_start": pref.notify_start,
             "open_watch": pref.open_watch,
+            "close_watch": pref.close_watch,
             "display_name": pref.display_name,
             "similarity_pct": clamp_similarity_pct(pref.similarity_pct),
             "ignore_color": pref.ignore_color,
@@ -1468,9 +1471,67 @@ import websockets
 
 
 WS_URL = "wss://eventsub.wss.twitch.tv/ws"
-# online + offline 才能開頁後關頁。每種事件成本 1，預算 10 → 最多 5 台。
-EVENT_TYPES = ("stream.online", "stream.offline")
-MAX_EVENTSUB_CHANNELS = 5
+# 每種事件成本 1。只聽開台＝1，再勾關網頁才加 offline。
+EVENT_ONLINE = "stream.online"
+EVENT_OFFLINE = "stream.offline"
+MAX_EVENTSUB_COST = 10
+
+
+@dataclass(frozen=True)
+class EventSubPlan:
+    included: tuple[str, ...]
+    skipped: tuple[str, ...]
+    cost: int
+    budget: int = MAX_EVENTSUB_COST
+
+    @property
+    def max_online_only(self) -> int:
+        return self.budget
+
+    @property
+    def max_with_close(self) -> int:
+        return self.budget // 2
+
+
+def eventsub_types(pref: ChannelPref) -> tuple[str, ...]:
+    types = [EVENT_ONLINE]
+    if pref.close_watch:
+        types.append(EVENT_OFFLINE)
+    return tuple(types)
+
+
+def eventsub_cost(pref: ChannelPref) -> int:
+    return len(eventsub_types(pref)) if pref.login else 0
+
+
+def plan_eventsub(
+    prefs: list[ChannelPref], budget: int = MAX_EVENTSUB_COST
+) -> EventSubPlan:
+    included: list[str] = []
+    skipped: list[str] = []
+    cost = 0
+    seen: set[str] = set()
+    for pref in prefs:
+        login = pref.login
+        if not login or login in seen:
+            continue
+        seen.add(login)
+        need = eventsub_cost(pref)
+        if need and cost + need <= budget:
+            included.append(login)
+            cost += need
+        else:
+            skipped.append(login)
+    return EventSubPlan(included=tuple(included), skipped=tuple(skipped), cost=cost, budget=budget)
+
+
+def describe_eventsub_plan(plan: EventSubPlan) -> str:
+    skip = f"，後面 {len(plan.skipped)} 台這次聽不到" if plan.skipped else ""
+    return (
+        f"EventSub 預算 {plan.cost}/{plan.budget}，這次可聽 {len(plan.included)} 台"
+        f"（只聽開台最多 {plan.max_online_only}；有勾關網頁各多佔 1，全勾關最多 {plan.max_with_close}）"
+        f"{skip}"
+    )
 
 LogFn = Callable[[str], None]
 EventFn = Callable[[str, dict], Awaitable[None] | None]
@@ -1530,11 +1591,15 @@ class EventSubClient:
         user_ids: dict[str, str],
         log: LogFn,
         on_event: EventFn,
+        events_by_login: dict[str, tuple[str, ...]] | None = None,
     ) -> None:
         self.http = http
         self.client_id = client_id
         self.access_token = access_token
         self.user_ids = user_ids
+        self.events_by_login = events_by_login or {
+            login: (EVENT_ONLINE,) for login in user_ids
+        }
         self.log = log
         self.on_event = on_event
 
@@ -1598,7 +1663,7 @@ class EventSubClient:
 
     async def _subscribe_all(self, session_id: str) -> None:
         for login, user_id in self.user_ids.items():
-            for event_type in EVENT_TYPES:
+            for event_type in self.events_by_login.get(login, (EVENT_ONLINE,)):
                 try:
                     await create_eventsub_subscription(
                         self.http,
@@ -2087,6 +2152,7 @@ class ChannelRow:
         self.notify_live_var = tk.BooleanVar(value=pref.notify_live)
         self.notify_start_var = tk.BooleanVar(value=pref.notify_start)
         self.open_watch_var = tk.BooleanVar(value=pref.open_watch)
+        self.close_watch_var = tk.BooleanVar(value=pref.close_watch)
         self.live_chk = tk.Checkbutton(
             self.frame,
             text="開台通知",
@@ -2116,7 +2182,17 @@ class ChannelRow:
             font=FONT,
             activebackground=PANEL,
         )
-        self.watch_chk.pack(side=tk.LEFT, padx=(0, 8))
+        self.watch_chk.pack(side=tk.LEFT)
+        self.close_chk = tk.Checkbutton(
+            self.frame,
+            text="關網頁",
+            variable=self.close_watch_var,
+            command=self.app._persist_watchlist,
+            bg=PANEL,
+            font=FONT,
+            activebackground=PANEL,
+        )
+        self.close_chk.pack(side=tk.LEFT, padx=(0, 8))
 
         tk.Label(self.frame, text="像", bg=PANEL, fg=MUTED, font=FONT).pack(side=tk.LEFT)
         self.similarity_var = tk.StringVar(value=str(pref.similarity_pct))
@@ -2192,6 +2268,7 @@ class ChannelRow:
             notify_live=bool(self.notify_live_var.get()),
             notify_start=bool(self.notify_start_var.get()),
             open_watch=bool(self.open_watch_var.get()),
+            close_watch=bool(self.close_watch_var.get()),
             display_name=self._saved_display_name(),
             similarity_pct=clamp_similarity_pct(self.similarity_var.get()),
             ignore_color=self.ignore_color,
@@ -2454,8 +2531,12 @@ class StreamMonitorApp:
         watch.pack(fill=tk.X, padx=14, pady=6)
         label(
             watch,
-            "每台可調「像待命」相似度（預設 60%）、略過標題等會變的顏色，並指定待命圖片或影片。勾「開網頁」會在開台時打開官方頁，關台時關掉我們開的那個視窗。名稱太長時可左右拖動這一列，以免看不到移除。",
+            "每台可調「像待命」相似度（預設 60%）、略過標題等會變的顏色，並指定待命圖片或影片。開網頁／關網頁分開勾。EventSub 預算 10：只聽開台每台 1，再勾關網頁 +1。名稱太長時可左右拖動這一列，以免看不到移除。",
         ).pack(fill=tk.X, pady=(0, 6))
+        self.eventsub_budget = tk.Label(
+            watch, text="", anchor="w", bg=PANEL, fg=MUTED, font=FONT
+        )
+        self.eventsub_budget.pack(fill=tk.X, pady=(0, 6))
         add_row = tk.Frame(watch, bg=PANEL)
         add_row.pack(fill=tk.X, pady=(0, 6))
         self.add_var = tk.StringVar()
@@ -2472,6 +2553,7 @@ class StreamMonitorApp:
             prefs = [ChannelPref(login="")]
         for pref in prefs:
             self._add_row(pref)
+        self._refresh_eventsub_budget()
         self._schedule_name_lookup()
 
         control = group(root, "監控控制")
@@ -2577,6 +2659,11 @@ class StreamMonitorApp:
             self.log(f"⚠️ 無法儲存頻道名單：{exc}")
             return
         self._active_prefs = {pref.login: pref for pref in prefs}
+        self._refresh_eventsub_budget()
+
+    def _refresh_eventsub_budget(self) -> None:
+        plan = plan_eventsub(self._prefs_from_ui())
+        self.eventsub_budget.config(text=describe_eventsub_plan(plan))
 
     def _schedule_name_lookup(self, logins: tuple[str, ...] | None = None) -> None:
         targets = logins if logins is not None else self._logins_from_ui()
@@ -2678,12 +2765,10 @@ class StreamMonitorApp:
         if not logins:
             self.log("❌ 請至少新增一個頻道")
             return
-        if len(logins) > MAX_EVENTSUB_CHANNELS:
-            extra = len(logins) - MAX_EVENTSUB_CHANNELS
-            self.log(
-                f"⚠️ 目前 {len(logins)} 台，EventSub 即時上限約 {MAX_EVENTSUB_CHANNELS} 台，"
-                f"後面 {extra} 台這次先不聽。"
-            )
+        plan = plan_eventsub(self._prefs_from_ui())
+        self.log(describe_eventsub_plan(plan))
+        if plan.skipped:
+            self.log(f"⚠️ 預算用完，這次不聽：{', '.join(plan.skipped)}")
         self._persist_watchlist()
         self._active_logins = logins
         self._active_prefs = {pref.login: pref for pref in self._prefs_from_ui()}
@@ -2799,10 +2884,20 @@ class StreamMonitorApp:
             )
             id_to_login = {user.user_id: login for login, user in users.items()}
             ordered = [login for login in settings.user_logins if login in user_ids]
-            eventsub_ids = {
-                login: user_ids[login] for login in ordered[:MAX_EVENTSUB_CHANNELS]
+            plan = plan_eventsub(
+                [
+                    self._active_prefs.get(login) or ChannelPref(login=login)
+                    for login in ordered
+                ]
+            )
+            eventsub_ids = {login: user_ids[login] for login in plan.included}
+            events_by_login = {
+                login: eventsub_types(
+                    self._active_prefs.get(login) or ChannelPref(login=login)
+                )
+                for login in plan.included
             }
-            skipped = [login for login in ordered if login not in eventsub_ids]
+            skipped = list(plan.skipped)
             live_ids = await live_user_ids(
                 http,
                 settings.twitch_client_id,
@@ -2857,11 +2952,16 @@ class StreamMonitorApp:
                 user_ids=eventsub_ids,
                 log=self.log,
                 on_event=on_event,
+                events_by_login=events_by_login,
             )
             if eventsub_ids:
-                self.log(f"⚡ EventSub 聽開台／關台：{', '.join(eventsub_ids)}")
+                detail = [
+                    f"{login}({'/'.join(events_by_login[login]).replace('stream.', '')})"
+                    for login in eventsub_ids
+                ]
+                self.log(f"⚡ EventSub {plan.cost}/{plan.budget}：{', '.join(detail)}")
             if skipped:
-                self.log(f"⚠️ 超過即時上限，這次不聽：{', '.join(skipped)}")
+                self.log(f"⚠️ 預算用完，這次不聽：{', '.join(skipped)}")
             self.log("✅ Twitch EventSub 已啟動")
             await client.run(stop_event)
             self._cancel_all_monitors()
@@ -2936,6 +3036,9 @@ class StreamMonitorApp:
         name = self._display_names.get(login, login)
         self.log(f"⚫ {name} ({login}) 關台了")
         self._cancel_monitor(login)
+        pref = self._active_prefs.get(login) or ChannelPref(login=login)
+        if not pref.close_watch:
+            return
         had_page = self._watch.has_page(login)
         closed = await asyncio.to_thread(self._watch.close_channel, login)
         if closed:
@@ -2951,7 +3054,9 @@ class StreamMonitorApp:
     def _cancel_all_monitors(self) -> None:
         for login in list(self._monitor_tasks):
             self._cancel_monitor(login)
-        self._watch.close_all()
+        for pref in self._active_prefs.values():
+            if pref.close_watch:
+                self._watch.close_channel(pref.login)
 
     async def _monitor_wrapper(
         self,
