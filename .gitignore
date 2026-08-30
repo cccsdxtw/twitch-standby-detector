@@ -22,5 +22,6 @@ dist/
 *.spec
 standby/*
 !standby/.gitkeep
+avatar_cache/
 
 
