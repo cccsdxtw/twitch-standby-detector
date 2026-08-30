@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import tempfile
 import unittest
 from unittest import mock
 
+from PIL import Image
+
 from app import (
+    AVATAR_SIZE,
     ChannelPref,
     TokenPair,
     app_dir,
+    avatar_cache_path,
     build_live_message,
     build_start_message,
     build_webhook_body,
@@ -20,10 +25,13 @@ from app import (
     parse_ignore_color,
     parse_logins,
     parse_ws_message,
+    prepare_avatar_image,
     save_channel_prefs,
     similarity_pct_to_threshold,
     token_from_response,
+    twitch_user_from_helix,
     upsert_env_values,
+    write_avatar_bytes,
 )
 
 
@@ -167,6 +175,48 @@ class SimilarityTests(unittest.TestCase):
     def test_parse_color(self) -> None:
         self.assertEqual(parse_ignore_color("#ff00aa"), (255, 0, 170))
         self.assertIsNone(parse_ignore_color(""))
+
+
+class AvatarTests(unittest.TestCase):
+    def test_helix_user_includes_profile_image(self) -> None:
+        user = twitch_user_from_helix(
+            {
+                "id": "1",
+                "login": "MaoRamei",
+                "display_name": "貓辣妹",
+                "profile_image_url": "https://static-cdn.jtvnw.net/x.png",
+            }
+        )
+        self.assertIsNotNone(user)
+        assert user is not None
+        self.assertEqual(user.login, "maoramei")
+        self.assertEqual(user.display_name, "貓辣妹")
+        self.assertEqual(user.profile_image_url, "https://static-cdn.jtvnw.net/x.png")
+
+    def test_helix_user_rejects_incomplete(self) -> None:
+        self.assertIsNone(twitch_user_from_helix({"login": "x", "display_name": "X"}))
+
+    def test_prepare_avatar_is_round_png_size(self) -> None:
+        src = Image.new("RGB", (300, 200), "red")
+        out = prepare_avatar_image(src, 24)
+        self.assertEqual(out.size, (24, 24))
+        self.assertEqual(out.mode, "RGBA")
+        self.assertEqual(out.getpixel((12, 12))[:3], (255, 0, 0))
+        self.assertEqual(out.getpixel((0, 0))[3], 0)
+
+    def test_write_and_cache_path(self) -> None:
+        buf = io.BytesIO()
+        Image.new("RGB", (64, 64), "blue").save(buf, "PNG")
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "face.png")
+            write_avatar_bytes(buf.getvalue(), dest)
+            self.assertTrue(os.path.isfile(dest))
+            with Image.open(dest) as img:
+                self.assertEqual(img.size, (AVATAR_SIZE, AVATAR_SIZE))
+            with mock.patch("app.app_dir", return_value=tmp):
+                path = avatar_cache_path("MaoRamei")
+            self.assertEqual(os.path.basename(path), "maoramei.png")
+            self.assertTrue(os.path.isdir(os.path.join(tmp, "avatar_cache")))
 
 
 class TokenTests(unittest.TestCase):

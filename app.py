@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import math
 import os
@@ -23,7 +24,7 @@ from typing import Any
 import httpx
 import tkinter as tk
 from dotenv import load_dotenv
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageDraw, UnidentifiedImageError
 from tkinter import colorchooser, filedialog, scrolledtext
 
 
@@ -142,6 +143,58 @@ def small_button(parent: tk.Widget, text: str, command, bg: str) -> tk.Button:
     )
 
 
+AVATAR_SIZE = 24
+_HSCROLL_SKIP = (tk.Entry, tk.Spinbox, tk.Button, tk.Checkbutton)
+
+
+def bind_hscroll_drag(canvas: tk.Canvas, widget: tk.Widget) -> None:
+    """讓頻道列可用滑鼠左右拖動，略過輸入框與按鈕以免搶操作。"""
+
+    def _start(event: tk.Event) -> None:
+        canvas.scan_mark(event.x_root, 0)
+
+    def _move(event: tk.Event) -> str | None:
+        canvas.scan_dragto(event.x_root, 0, gain=1)
+        return "break"
+
+    def _walk(node: tk.Widget) -> None:
+        if isinstance(node, _HSCROLL_SKIP):
+            return
+        node.bind("<ButtonPress-1>", _start, add="+")
+        node.bind("<B1-Motion>", _move, add="+")
+        for child in node.winfo_children():
+            _walk(child)
+
+    _walk(widget)
+
+
+def attach_hscroll(parent: tk.Widget) -> tuple[tk.Canvas, tk.Frame]:
+    """回傳 (canvas, inner)。inner 用來放頻道列，超出寬度可左右拖。"""
+    wrap = tk.Frame(parent, bg=PANEL)
+    wrap.pack(fill=tk.X)
+    canvas = tk.Canvas(wrap, bg=PANEL, highlightthickness=0, bd=0, height=40)
+    bar = tk.Scrollbar(wrap, orient=tk.HORIZONTAL, command=canvas.xview)
+    canvas.configure(xscrollcommand=bar.set)
+    canvas.pack(fill=tk.X)
+    bar.pack(fill=tk.X)
+    inner = tk.Frame(canvas, bg=PANEL)
+    window = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+    def _sync(_event: tk.Event | None = None) -> None:
+        inner.update_idletasks()
+        bbox = canvas.bbox("all")
+        if not bbox:
+            return
+        canvas.configure(scrollregion=bbox)
+        canvas.configure(height=max(40, bbox[3] - bbox[1]))
+        canvas.itemconfigure(window, height=bbox[3] - bbox[1])
+
+    inner.bind("<Configure>", _sync)
+    bind_hscroll_drag(canvas, canvas)
+    bind_hscroll_drag(canvas, inner)
+    return canvas, inner
+
+
 # === paths.py ===
 
 import os
@@ -162,6 +215,46 @@ def get_resource_path(relative_path: str) -> str:
     else:
         base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, relative_path)
+
+
+def avatar_cache_dir() -> str:
+    path = os.path.join(app_dir(), "avatar_cache")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def avatar_cache_path(login: str) -> str:
+    return os.path.join(avatar_cache_dir(), f"{normalize_login(login)}.png")
+
+
+def prepare_avatar_image(image: Image.Image, size: int = AVATAR_SIZE) -> Image.Image:
+    """縮成圓形頭像，給 Tk 顯示。"""
+    square = image.convert("RGBA").resize((size, size), Image.Resampling.LANCZOS)
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
+    square.putalpha(mask)
+    return square
+
+
+def write_avatar_bytes(data: bytes, dest: str, size: int = AVATAR_SIZE) -> str:
+    with Image.open(io.BytesIO(data)) as src:
+        prepare_avatar_image(src, size).save(dest, "PNG")
+    return dest
+
+
+async def cache_profile_image(
+    client: httpx.AsyncClient, url: str, dest: str
+) -> bool:
+    if not url:
+        return False
+    try:
+        response = await client.get(url, timeout=20.0, follow_redirects=True)
+        if response.status_code >= 400 or not response.content:
+            return False
+        write_avatar_bytes(response.content, dest)
+        return True
+    except (httpx.HTTPError, OSError, UnidentifiedImageError, ValueError):
+        return False
 
 
 # === image_hash.py ===
@@ -970,6 +1063,22 @@ class TwitchUser:
     login: str
     user_id: str
     display_name: str
+    profile_image_url: str = ""
+
+
+def twitch_user_from_helix(user: dict[str, Any]) -> TwitchUser | None:
+    login = str(user.get("login", "")).lower()
+    uid = str(user.get("id", ""))
+    display = str(user.get("display_name") or user.get("login") or "")
+    avatar = str(user.get("profile_image_url") or "")
+    if not login or not uid:
+        return None
+    return TwitchUser(
+        login=login,
+        user_id=uid,
+        display_name=display,
+        profile_image_url=avatar,
+    )
 
 
 def _headers(client_id: str, access_token: str) -> dict[str, str]:
@@ -1007,11 +1116,9 @@ async def resolve_users(
     payload = await _json(response)
     mapping: dict[str, TwitchUser] = {}
     for user in payload.get("data") or []:
-        login = str(user.get("login", "")).lower()
-        uid = str(user.get("id", ""))
-        display = str(user.get("display_name") or user.get("login") or "")
-        if login and uid:
-            mapping[login] = TwitchUser(login=login, user_id=uid, display_name=display)
+        parsed = twitch_user_from_helix(user) if isinstance(user, dict) else None
+        if parsed:
+            mapping[parsed.login] = parsed
     return mapping
 
 
@@ -1792,18 +1899,22 @@ class ChannelRow:
         self.entry.bind("<FocusOut>", self._on_login_changed)
         self.entry.bind("<Return>", self._on_login_changed)
 
+        self._avatar_photo = None
+        self.avatar_label = tk.Label(self.frame, bg=PANEL, width=3)
+        self.avatar_label.pack(side=tk.LEFT, padx=(0, 4))
+
         self.name_var = tk.StringVar(value=pref.display_name.strip())
         self.name_label = tk.Label(
             self.frame,
             textvariable=self.name_var,
             anchor="w",
-            width=14,
             bg=PANEL,
             fg=MUTED,
             font=FONT_BOLD,
         )
         self.name_label.pack(side=tk.LEFT, padx=(0, 8))
         self._named_login = pref.login.lower() if pref.display_name.strip() else ""
+        self.refresh_avatar()
 
         self.notify_live_var = tk.BooleanVar(value=pref.notify_live)
         self.notify_start_var = tk.BooleanVar(value=pref.notify_start)
@@ -1924,6 +2035,24 @@ class ChannelRow:
         self._named_login = login if text else ""
         self.name_var.set(text)
         self.name_label.config(fg=FG if text else MUTED)
+        if not text or missing:
+            self.refresh_avatar()
+
+    def refresh_avatar(self) -> None:
+        login = self.login()
+        path = avatar_cache_path(login) if login else ""
+        if login and os.path.isfile(path):
+            try:
+                from PIL import ImageTk
+
+                with Image.open(path) as img:
+                    self._avatar_photo = ImageTk.PhotoImage(img.copy())
+                self.avatar_label.config(image=self._avatar_photo, text="", width=AVATAR_SIZE)
+                return
+            except (OSError, UnidentifiedImageError, tk.TclError):
+                pass
+        self._avatar_photo = None
+        self.avatar_label.config(image="", text="", width=3)
 
     def _on_login_changed(self, _event=None) -> None:
         login = self.login()
@@ -1937,8 +2066,10 @@ class ChannelRow:
             "查名字中…",
             "找不到這台",
         }:
+            self.refresh_avatar()
             return
         self.set_display_name("查名字中…")
+        self.refresh_avatar()
         self.app._schedule_name_lookup((login,))
         self.app._persist_watchlist()
 
@@ -2142,7 +2273,7 @@ class StreamMonitorApp:
         watch.pack(fill=tk.X, padx=14, pady=6)
         label(
             watch,
-            "每台可調「像待命」相似度（預設 60%）、略過標題等會變的顏色，並指定待命圖片或影片。",
+            "每台可調「像待命」相似度（預設 60%）、略過標題等會變的顏色，並指定待命圖片或影片。名稱太長時可左右拖動這一列，以免看不到移除。",
         ).pack(fill=tk.X, pady=(0, 6))
         add_row = tk.Frame(watch, bg=PANEL)
         add_row.pack(fill=tk.X, pady=(0, 6))
@@ -2151,8 +2282,7 @@ class StreamMonitorApp:
         color_button(add_row, "＋ 新增頻道", self._add_from_entry, ORANGE).pack(
             side=tk.LEFT, padx=(8, 0)
         )
-        self.list_frame = tk.Frame(watch, bg=PANEL)
-        self.list_frame.pack(fill=tk.X)
+        self.list_canvas, self.list_frame = attach_hscroll(watch)
 
         prefs = load_channel_prefs()
         if not prefs and initial.user_logins:
@@ -2232,6 +2362,7 @@ class StreamMonitorApp:
         if pref.login and not pref.display_name.strip():
             row.set_display_name("查名字中…")
         self.rows.append(row)
+        bind_hscroll_drag(self.list_canvas, row.frame)
 
     def _remove_row(self, row: ChannelRow) -> None:
         if row in self.rows:
@@ -2305,6 +2436,11 @@ class StreamMonitorApp:
                 token,
                 logins,
             )
+            for login, user in users.items():
+                if user.profile_image_url:
+                    await cache_profile_image(
+                        client, user.profile_image_url, avatar_cache_path(login)
+                    )
         missing = [login for login in logins if login not in users]
         return users, missing
 
@@ -2327,9 +2463,11 @@ class StreamMonitorApp:
             user = users.get(login)
             if user:
                 row.set_display_name(user.display_name)
+                row.refresh_avatar()
                 self._display_names[login] = user.display_name or login
             elif login in missing:
                 row.set_display_name("", missing=True)
+                row.refresh_avatar()
         self._persist_watchlist()
 
     def log(self, message: str) -> None:
