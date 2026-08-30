@@ -27,6 +27,7 @@ from app import (
     parse_ws_message,
     prepare_avatar_image,
     save_channel_prefs,
+    twitch_channel_url,
     similarity_pct_to_threshold,
     token_from_response,
     twitch_user_from_helix,
@@ -141,6 +142,7 @@ class WatchlistPrefTests(unittest.TestCase):
                             "maoramei",
                             notify_live=True,
                             notify_start=False,
+                            open_watch=True,
                             display_name="貓辣妹",
                             similarity_pct=70,
                             ignore_color="#ffffff",
@@ -154,13 +156,28 @@ class WatchlistPrefTests(unittest.TestCase):
         self.assertEqual(prefs[0].display_name, "貓辣妹")
         self.assertTrue(prefs[0].notify_live)
         self.assertFalse(prefs[0].notify_start)
+        self.assertTrue(prefs[0].open_watch)
         self.assertFalse(prefs[1].notify_live)
         self.assertTrue(prefs[1].notify_start)
+        self.assertFalse(prefs[1].open_watch)
         self.assertEqual(prefs[1].display_name, "")
         self.assertEqual(prefs[0].similarity_pct, 70)
         self.assertEqual(prefs[0].ignore_color, "#ffffff")
         self.assertEqual(prefs[0].ignore_tolerance, 35)
         self.assertEqual(prefs[1].similarity_pct, 60)
+
+    def test_open_watch_defaults_off(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "watchlist.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write('[{"login": "maoramei", "notify_live": true}]\n')
+            with mock.patch("app.app_dir", return_value=tmp):
+                prefs = load_channel_prefs()
+        self.assertFalse(prefs[0].open_watch)
+
+    def test_channel_url(self) -> None:
+        self.assertEqual(twitch_channel_url("MaoRamei"), "https://www.twitch.tv/maoramei")
+        self.assertEqual(twitch_channel_url(""), "")
 
 
 class SimilarityTests(unittest.TestCase):

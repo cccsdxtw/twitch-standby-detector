@@ -447,6 +447,7 @@ class ChannelPref:
     login: str
     notify_live: bool = True
     notify_start: bool = True
+    open_watch: bool = False
     display_name: str = ""
     similarity_pct: int = DEFAULT_SIMILARITY_PCT
     ignore_color: str = ""
@@ -519,6 +520,7 @@ def load_channel_prefs() -> list[ChannelPref]:
                         login=login,
                         notify_live=bool(item.get("notify_live", True)),
                         notify_start=bool(item.get("notify_start", True)),
+                        open_watch=bool(item.get("open_watch", False)),
                         display_name=str(item.get("display_name") or ""),
                         similarity_pct=clamp_similarity_pct(
                             item.get("similarity_pct", DEFAULT_SIMILARITY_PCT)
@@ -542,6 +544,7 @@ def save_channel_prefs(prefs: list[ChannelPref]) -> None:
             "login": pref.login,
             "notify_live": pref.notify_live,
             "notify_start": pref.notify_start,
+            "open_watch": pref.open_watch,
             "display_name": pref.display_name,
             "similarity_pct": clamp_similarity_pct(pref.similarity_pct),
             "ignore_color": pref.ignore_color,
@@ -656,10 +659,26 @@ def build_webhook_body(content: str) -> dict:
     return {"content": content[:2000]}
 
 
+def twitch_channel_url(login: str) -> str:
+    handle = normalize_login(login)
+    return f"https://www.twitch.tv/{handle}" if handle else ""
+
+
+def open_twitch_channel(login: str) -> bool:
+    """開官方頻道頁。連續觀看只認瀏覽器登入後的 twitch.tv，沒有 API 可代打。"""
+    url = twitch_channel_url(login)
+    if not url:
+        return False
+    try:
+        return bool(webbrowser.open(url, new=2))
+    except Exception:
+        return False
+
+
 def build_live_message(display_name: str, login: str) -> str:
     name = (display_name or login).strip() or login
     handle = (login or "").strip().lower()
-    return f"「{name}」在實況了\n來去 https://www.twitch.tv/{handle} 看看"
+    return f"「{name}」在實況了\n來去 {twitch_channel_url(handle)} 看看"
 
 
 def build_start_message(display_name: str, login: str) -> str:
@@ -1918,6 +1937,7 @@ class ChannelRow:
 
         self.notify_live_var = tk.BooleanVar(value=pref.notify_live)
         self.notify_start_var = tk.BooleanVar(value=pref.notify_start)
+        self.open_watch_var = tk.BooleanVar(value=pref.open_watch)
         self.live_chk = tk.Checkbutton(
             self.frame,
             text="開台通知",
@@ -1937,7 +1957,17 @@ class ChannelRow:
             font=FONT,
             activebackground=PANEL,
         )
-        self.start_chk.pack(side=tk.LEFT, padx=(0, 8))
+        self.start_chk.pack(side=tk.LEFT)
+        self.watch_chk = tk.Checkbutton(
+            self.frame,
+            text="連看",
+            variable=self.open_watch_var,
+            command=self.app._persist_watchlist,
+            bg=PANEL,
+            font=FONT,
+            activebackground=PANEL,
+        )
+        self.watch_chk.pack(side=tk.LEFT, padx=(0, 8))
 
         tk.Label(self.frame, text="像", bg=PANEL, fg=MUTED, font=FONT).pack(side=tk.LEFT)
         self.similarity_var = tk.StringVar(value=str(pref.similarity_pct))
@@ -2012,6 +2042,7 @@ class ChannelRow:
             login=name,
             notify_live=bool(self.notify_live_var.get()),
             notify_start=bool(self.notify_start_var.get()),
+            open_watch=bool(self.open_watch_var.get()),
             display_name=self._saved_display_name(),
             similarity_pct=clamp_similarity_pct(self.similarity_var.get()),
             ignore_color=self.ignore_color,
@@ -2273,7 +2304,7 @@ class StreamMonitorApp:
         watch.pack(fill=tk.X, padx=14, pady=6)
         label(
             watch,
-            "每台可調「像待命」相似度（預設 60%）、略過標題等會變的顏色，並指定待命圖片或影片。名稱太長時可左右拖動這一列，以免看不到移除。",
+            "每台可調「像待命」相似度（預設 60%）、略過標題等會變的顏色，並指定待命圖片或影片。勾「連看」才會在開台時打開官方頁（瀏覽器需已登入圖奇）。名稱太長時可左右拖動這一列，以免看不到移除。",
         ).pack(fill=tk.X, pady=(0, 6))
         add_row = tk.Frame(watch, bg=PANEL)
         add_row.pack(fill=tk.X, pady=(0, 6))
@@ -2711,6 +2742,11 @@ class StreamMonitorApp:
                 )
             else:
                 self.log(f"ℹ️ [{login}] 開台通知已關閉")
+            if pref.open_watch:
+                if open_twitch_channel(login):
+                    self.log(f"🌐 [{login}] 已打開頻道頁（連看）")
+                else:
+                    self.log(f"⚠️ [{login}] 打不開瀏覽器，請自行開 {twitch_channel_url(login)}")
         await self._start_monitor(
             login, settings, http, stop_event, already_live=already_live
         )
