@@ -28,6 +28,9 @@ from app import (
     prepare_avatar_image,
     save_channel_prefs,
     twitch_channel_url,
+    cdp_close_tab_url,
+    cdp_new_tab_url,
+    parse_cdp_target_id,
     similarity_pct_to_threshold,
     token_from_response,
     twitch_user_from_helix,
@@ -113,6 +116,19 @@ class EventSubParseTests(unittest.TestCase):
         self.assertEqual(event_type, "stream.online")
         self.assertEqual(event["broadcaster_user_login"], "lanmeinotbeer")
 
+    def test_notification_offline(self) -> None:
+        raw = {
+            "metadata": {"message_type": "notification"},
+            "payload": {
+                "subscription": {"type": "stream.offline"},
+                "event": {"broadcaster_user_login": "maoramei"},
+            },
+        }
+        _msg_type, data = parse_ws_message(json.dumps(raw))
+        event_type, event = event_from_notification(data)
+        self.assertEqual(event_type, "stream.offline")
+        self.assertEqual(event["broadcaster_user_login"], "maoramei")
+
 
 class DiscordTests(unittest.TestCase):
     def test_truncates_content(self) -> None:
@@ -178,6 +194,15 @@ class WatchlistPrefTests(unittest.TestCase):
     def test_channel_url(self) -> None:
         self.assertEqual(twitch_channel_url("MaoRamei"), "https://www.twitch.tv/maoramei")
         self.assertEqual(twitch_channel_url(""), "")
+
+    def test_cdp_urls_and_target_id(self) -> None:
+        self.assertIn(
+            "json/new?https%3A%2F%2Fwww.twitch.tv%2Fmaoramei",
+            cdp_new_tab_url("https://www.twitch.tv/maoramei"),
+        )
+        self.assertIn("json/close/abc-1", cdp_close_tab_url("abc-1"))
+        self.assertEqual(parse_cdp_target_id({"id": "tab-9"}), "tab-9")
+        self.assertEqual(parse_cdp_target_id({}), "")
 
 
 class SimilarityTests(unittest.TestCase):

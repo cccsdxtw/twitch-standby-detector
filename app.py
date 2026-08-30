@@ -15,6 +15,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 import webbrowser
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
@@ -664,15 +666,163 @@ def twitch_channel_url(login: str) -> str:
     return f"https://www.twitch.tv/{handle}" if handle else ""
 
 
-def open_twitch_channel(login: str) -> bool:
-    """開官方頻道頁。連續觀看只認瀏覽器登入後的 twitch.tv，沒有 API 可代打。"""
-    url = twitch_channel_url(login)
-    if not url:
+WATCH_CDP_PORT = 9333
+
+
+def watch_profile_dir() -> str:
+    path = os.path.join(app_dir(), "twitch_watch_profile")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def find_browser_exe() -> str | None:
+    override = (os.environ.get("TWITCH_BROWSER") or "").strip()
+    if override and os.path.isfile(override):
+        return override
+    if sys.platform == "win32":
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        local = os.environ.get("LOCALAPPDATA", "")
+        candidates = [
+            os.path.join(pf, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(local, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(pf, "Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join(pf86, "Microsoft", "Edge", "Application", "msedge.exe"),
+        ]
+    elif sys.platform == "darwin":
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ]
+    else:
+        for name in (
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            "microsoft-edge",
+        ):
+            found = shutil.which(name)
+            if found:
+                return found
+        candidates = []
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def cdp_new_tab_url(page_url: str, port: int = WATCH_CDP_PORT) -> str:
+    return f"http://127.0.0.1:{port}/json/new?{urllib.parse.quote(page_url, safe='')}"
+
+
+def cdp_close_tab_url(target_id: str, port: int = WATCH_CDP_PORT) -> str:
+    return f"http://127.0.0.1:{port}/json/close/{urllib.parse.quote(target_id, safe='')}"
+
+
+def parse_cdp_target_id(payload: Any) -> str:
+    if isinstance(payload, dict):
+        return str(payload.get("id") or "")
+    return ""
+
+
+class WatchBrowser:
+    """獨立 Chromium/Edge 視窗：開台開頁、關台關頁。系統預設瀏覽器關不掉分頁。"""
+
+    def __init__(self, port: int = WATCH_CDP_PORT) -> None:
+        self.port = port
+        self._proc: subprocess.Popen[bytes] | None = None
+        self._targets: dict[str, str] = {}
+        self.used_system_fallback: set[str] = set()
+
+    def open_channel(self, login: str) -> bool:
+        handle = normalize_login(login)
+        url = twitch_channel_url(handle)
+        if not url:
+            return False
+        if handle in self._targets:
+            return True
+        if self._ensure_browser():
+            try:
+                target = self._cdp_open(url)
+            except (OSError, TimeoutError, json.JSONDecodeError, ValueError):
+                target = ""
+            if target:
+                self._targets[handle] = target
+                self.used_system_fallback.discard(handle)
+                return True
+        try:
+            ok = bool(webbrowser.open(url, new=2))
+        except Exception:
+            return False
+        if ok:
+            self.used_system_fallback.add(handle)
+        return ok
+
+    def has_page(self, login: str) -> bool:
+        handle = normalize_login(login)
+        return handle in self._targets or handle in self.used_system_fallback
+
+    def close_channel(self, login: str) -> bool:
+        handle = normalize_login(login)
+        target = self._targets.pop(handle, "")
+        self.used_system_fallback.discard(handle)
+        if not target:
+            return False
+        try:
+            self._cdp_close(target)
+            return True
+        except (OSError, TimeoutError, ValueError):
+            return False
+
+    def close_all(self) -> None:
+        for login in list(self._targets) + list(self.used_system_fallback):
+            self.close_channel(login)
+
+    def _cdp_ready(self) -> bool:
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/json/version", timeout=0.4
+            ) as resp:
+                return 200 <= getattr(resp, "status", 200) < 300
+        except (OSError, TimeoutError):
+            return False
+
+    def _ensure_browser(self) -> bool:
+        if self._cdp_ready():
+            return True
+        exe = find_browser_exe()
+        if not exe:
+            return False
+        args = [
+            exe,
+            f"--user-data-dir={watch_profile_dir()}",
+            f"--remote-debugging-port={self.port}",
+            "--remote-debugging-address=127.0.0.1",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "about:blank",
+        ]
+        try:
+            self._proc = subprocess.Popen(
+                args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except OSError:
+            return False
+        for _ in range(50):
+            if self._cdp_ready():
+                return True
+            time.sleep(0.1)
         return False
-    try:
-        return bool(webbrowser.open(url, new=2))
-    except Exception:
-        return False
+
+    def _cdp_open(self, url: str) -> str:
+        with urllib.request.urlopen(cdp_new_tab_url(url, self.port), timeout=8) as resp:
+            payload = json.loads(resp.read().decode("utf-8") or "{}")
+        return parse_cdp_target_id(payload)
+
+    def _cdp_close(self, target_id: str) -> None:
+        with urllib.request.urlopen(cdp_close_tab_url(target_id, self.port), timeout=8):
+            pass
 
 
 def build_live_message(display_name: str, login: str) -> str:
@@ -1318,10 +1468,9 @@ import websockets
 
 
 WS_URL = "wss://eventsub.wss.twitch.tv/ws"
-# 正片判定不靠 offline。只訂 online 省成本。
-EVENT_TYPES = ("stream.online",)
-# WebSocket 全帳號 max_total_cost=10；每台 online 佔 1。多連線不會加預算。
-MAX_EVENTSUB_CHANNELS = 10
+# online + offline 才能開頁後關頁。每種事件成本 1，預算 10 → 最多 5 台。
+EVENT_TYPES = ("stream.online", "stream.offline")
+MAX_EVENTSUB_CHANNELS = 5
 
 LogFn = Callable[[str], None]
 EventFn = Callable[[str, dict], Awaitable[None] | None]
@@ -1960,7 +2109,7 @@ class ChannelRow:
         self.start_chk.pack(side=tk.LEFT)
         self.watch_chk = tk.Checkbutton(
             self.frame,
-            text="連看",
+            text="開網頁",
             variable=self.open_watch_var,
             command=self.app._persist_watchlist,
             bg=PANEL,
@@ -2282,6 +2431,7 @@ class StreamMonitorApp:
         self._active_logins: tuple[str, ...] = ()
         self._active_prefs: dict[str, ChannelPref] = {}
         self._display_names: dict[str, str] = {}
+        self._watch = WatchBrowser()
         self.rows: list[ChannelRow] = []
 
         initial = load_settings()
@@ -2304,7 +2454,7 @@ class StreamMonitorApp:
         watch.pack(fill=tk.X, padx=14, pady=6)
         label(
             watch,
-            "每台可調「像待命」相似度（預設 60%）、略過標題等會變的顏色，並指定待命圖片或影片。勾「連看」才會在開台時打開官方頁（瀏覽器需已登入圖奇）。名稱太長時可左右拖動這一列，以免看不到移除。",
+            "每台可調「像待命」相似度（預設 60%）、略過標題等會變的顏色，並指定待命圖片或影片。勾「開網頁」會在開台時打開官方頁，關台時關掉我們開的那個視窗。名稱太長時可左右拖動這一列，以免看不到移除。",
         ).pack(fill=tk.X, pady=(0, 6))
         add_row = tk.Frame(watch, bg=PANEL)
         add_row.pack(fill=tk.X, pady=(0, 6))
@@ -2697,6 +2847,8 @@ class StreamMonitorApp:
                         source="EventSub",
                         already_live=False,
                     )
+                elif event_type == "stream.offline":
+                    await self._channel_went_offline(login)
 
             client = EventSubClient(
                 http=http,
@@ -2707,7 +2859,7 @@ class StreamMonitorApp:
                 on_event=on_event,
             )
             if eventsub_ids:
-                self.log(f"⚡ EventSub 聽開台：{', '.join(eventsub_ids)}")
+                self.log(f"⚡ EventSub 聽開台／關台：{', '.join(eventsub_ids)}")
             if skipped:
                 self.log(f"⚠️ 超過即時上限，這次不聽：{', '.join(skipped)}")
             self.log("✅ Twitch EventSub 已啟動")
@@ -2728,11 +2880,11 @@ class StreamMonitorApp:
         if existing and not existing.done():
             return
         name = self._display_names.get(login, login)
+        pref = self._active_prefs.get(login) or ChannelPref(login=login)
         if already_live:
             self.log(f"🔴 啟動時已在直播：{name} ({login})")
         else:
             self.log(f"🚨 {source}：{name} ({login}) 開台了！")
-            pref = self._active_prefs.get(login) or ChannelPref(login=login)
             if pref.notify_live:
                 await send_webhook(
                     settings.discord_webhook_url,
@@ -2742,11 +2894,8 @@ class StreamMonitorApp:
                 )
             else:
                 self.log(f"ℹ️ [{login}] 開台通知已關閉")
-            if pref.open_watch:
-                if open_twitch_channel(login):
-                    self.log(f"🌐 [{login}] 已打開頻道頁（連看）")
-                else:
-                    self.log(f"⚠️ [{login}] 打不開瀏覽器，請自行開 {twitch_channel_url(login)}")
+        if pref.open_watch:
+            await self._open_watch_page(login)
         await self._start_monitor(
             login, settings, http, stop_event, already_live=already_live
         )
@@ -2773,6 +2922,27 @@ class StreamMonitorApp:
             )
         )
 
+    async def _open_watch_page(self, login: str) -> None:
+        opened = await asyncio.to_thread(self._watch.open_channel, login)
+        if opened:
+            if login in self._watch.used_system_fallback:
+                self.log(f"🌐 [{login}] 已用系統瀏覽器打開（關台時可能關不掉分頁）")
+            else:
+                self.log(f"🌐 [{login}] 已打開頻道頁")
+        else:
+            self.log(f"⚠️ [{login}] 打不開瀏覽器，請自行開 {twitch_channel_url(login)}")
+
+    async def _channel_went_offline(self, login: str) -> None:
+        name = self._display_names.get(login, login)
+        self.log(f"⚫ {name} ({login}) 關台了")
+        self._cancel_monitor(login)
+        had_page = self._watch.has_page(login)
+        closed = await asyncio.to_thread(self._watch.close_channel, login)
+        if closed:
+            self.log(f"🪟 [{login}] 已關掉頻道頁")
+        elif had_page:
+            self.log(f"⚠️ [{login}] 這頁是系統瀏覽器開的，請自行關掉分頁")
+
     def _cancel_monitor(self, login: str) -> None:
         task = self._monitor_tasks.pop(login, None)
         if task and not task.done():
@@ -2781,6 +2951,7 @@ class StreamMonitorApp:
     def _cancel_all_monitors(self) -> None:
         for login in list(self._monitor_tasks):
             self._cancel_monitor(login)
+        self._watch.close_all()
 
     async def _monitor_wrapper(
         self,

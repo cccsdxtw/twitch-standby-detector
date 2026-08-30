@@ -23,5 +23,6 @@ dist/
 standby/*
 !standby/.gitkeep
 avatar_cache/
+twitch_watch_profile/
 
 
