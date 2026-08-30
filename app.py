@@ -2110,7 +2110,7 @@ async def _kill_all(procs: list[asyncio.subprocess.Process]) -> None:
 
 # === app ===
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 
 class ChannelRow:
