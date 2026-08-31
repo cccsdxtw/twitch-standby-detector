@@ -642,11 +642,22 @@ def clamp_skip_start_after_min(
     return min(minutes, 24 * 60)
 
 
+def skip_start_hms(minutes: int) -> tuple[int, int]:
+    minutes = clamp_skip_start_after_min(minutes)
+    return minutes // 60, minutes % 60
+
+
 def skip_start_after_label(minutes: int) -> str:
     minutes = clamp_skip_start_after_min(minutes)
     if minutes == 0:
         return "不略過"
-    return f"{minutes} 分鐘"
+    hours, mins = skip_start_hms(minutes)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours} 小時")
+    if mins:
+        parts.append(f"{mins} 分鐘")
+    return " ".join(parts)
 
 
 def parse_helix_time(raw: object) -> datetime | None:
@@ -2554,15 +2565,23 @@ class SettingsWindow(tk.Toplevel):
         self.webhook = self._field(
             box, "Discord Webhook 網址", current.discord_webhook_url, ""
         )
-        self.skip_start = self._field(
-            box,
-            "開台超過幾分鐘就不再偵測開頭（0＝不略過，預設 60）",
-            str(current.skip_start_after_min),
-            "",
+        label(box, "開台超過多久就不再偵測開頭（兩個都 0＝不略過）").pack(
+            fill=tk.X, pady=(8, 0)
         )
+        skip_row = tk.Frame(box, bg=PANEL)
+        skip_row.pack(fill=tk.X, pady=(2, 4))
+        hours, mins = skip_start_hms(current.skip_start_after_min)
+        self.skip_hours = entry(skip_row, None, width=6)
+        self.skip_hours.pack(side=tk.LEFT)
+        self.skip_hours.insert(0, str(hours))
+        tk.Label(skip_row, text=" 小時 ", bg=PANEL, fg=FG, font=FONT).pack(side=tk.LEFT)
+        self.skip_mins = entry(skip_row, None, width=6)
+        self.skip_mins.pack(side=tk.LEFT)
+        self.skip_mins.insert(0, str(mins))
+        tk.Label(skip_row, text=" 分鐘", bg=PANEL, fg=FG, font=FONT).pack(side=tk.LEFT)
         label(
             box,
-            "剛開台仍會偵測；已播超過這個分鐘數就停抽幀、不打正片開始。",
+            "例如 0 小時 46 分，或 1 小時 20 分。剛開台仍會偵測；超過此時長就停抽幀。",
             fg=MUTED,
         ).pack(anchor="w", pady=(0, 8))
 
@@ -2584,7 +2603,17 @@ class SettingsWindow(tk.Toplevel):
         return widget
 
     def _skip_start_minutes(self) -> int:
-        return clamp_skip_start_after_min(self.skip_start.get().strip())
+        try:
+            hours = int((self.skip_hours.get() or "0").strip() or "0")
+        except ValueError:
+            hours = 0
+        try:
+            mins = int((self.skip_mins.get() or "0").strip() or "0")
+        except ValueError:
+            mins = 0
+        hours = max(0, hours)
+        mins = max(0, mins)
+        return clamp_skip_start_after_min(hours * 60 + mins)
 
     def _save(self) -> None:
         try:

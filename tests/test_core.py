@@ -27,6 +27,7 @@ from app import (
     parse_ignore_color,
     should_skip_start_detect,
     clamp_skip_start_after_min,
+    skip_start_hms,
     skip_start_after_label,
     parse_logins,
     plan_eventsub,
@@ -272,8 +273,12 @@ class SkipStartDetectTests(unittest.TestCase):
         self.assertEqual(clamp_skip_start_after_min("60"), 60)
         self.assertEqual(clamp_skip_start_after_min("-3"), 60)
         self.assertEqual(clamp_skip_start_after_min("x"), 60)
-        self.assertEqual(skip_start_after_label(60), "60 分鐘")
+        self.assertEqual(skip_start_after_label(60), "1 小時")
+        self.assertEqual(skip_start_after_label(46), "46 分鐘")
+        self.assertEqual(skip_start_after_label(90), "1 小時 30 分鐘")
         self.assertEqual(skip_start_after_label(0), "不略過")
+        self.assertEqual(skip_start_hms(90), (1, 30))
+        self.assertEqual(skip_start_hms(46), (0, 46))
 
 
 class SimilarityTests(unittest.TestCase):
