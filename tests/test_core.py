@@ -45,6 +45,8 @@ from app import (
     twitch_user_from_helix,
     upsert_env_values,
     write_avatar_bytes,
+    row_phase_style,
+    ROW_PHASES,
 )
 
 
@@ -335,6 +337,36 @@ class AvatarTests(unittest.TestCase):
                 path = avatar_cache_path("MaoRamei")
             self.assertEqual(os.path.basename(path), "maoramei.png")
             self.assertTrue(os.path.isdir(os.path.join(tmp, "avatar_cache")))
+
+
+class RowPhaseStyleTests(unittest.TestCase):
+    def test_known_phases_have_distinct_labels(self) -> None:
+        labels = [row_phase_style(key)[0] for key in ROW_PHASES]
+        self.assertEqual(len(labels), len(set(labels)))
+        self.assertEqual(row_phase_style("idle"), ("未監控", "#555555"))
+        self.assertEqual(row_phase_style("listening")[0], "聽開台中")
+        self.assertEqual(row_phase_style("detecting")[0], "偵測開頭中")
+        self.assertEqual(row_phase_style("skipped")[0], "已略過開頭")
+        self.assertEqual(row_phase_style("live")[0], "直播中")
+        self.assertEqual(row_phase_style("main")[0], "正片已開始")
+        self.assertEqual(row_phase_style("offline")[0], "已關台")
+        self.assertEqual(row_phase_style("failed")[0], "偵測失敗")
+        self.assertEqual(row_phase_style("unsubscribed")[0], "這次不聽")
+
+    def test_unknown_falls_back_to_idle(self) -> None:
+        self.assertEqual(row_phase_style("nope"), row_phase_style("idle"))
+
+    def test_colors_match_theme(self) -> None:
+        from app import BLUE, ERR, GREEN, MUTED, OK, ORANGE, WARN
+
+        self.assertEqual(row_phase_style("listening")[1], BLUE)
+        self.assertEqual(row_phase_style("detecting")[1], ORANGE)
+        self.assertEqual(row_phase_style("skipped")[1], WARN)
+        self.assertEqual(row_phase_style("live")[1], GREEN)
+        self.assertEqual(row_phase_style("main")[1], OK)
+        self.assertEqual(row_phase_style("failed")[1], ERR)
+        self.assertEqual(row_phase_style("idle")[1], MUTED)
+        self.assertEqual(row_phase_style("offline")[1], MUTED)
 
 
 class TokenTests(unittest.TestCase):

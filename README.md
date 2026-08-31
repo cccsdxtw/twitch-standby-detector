@@ -1,6 +1,6 @@
 # 實況守門員
 
-Twitch 待命畫面 / 正片切換監控。版本 **v0.12.0**。版本號避開 4。
+Twitch 待命畫面 / 正片切換監控。版本 **v0.13.0**。版本號避開 4。
 
 桌面程式：Tkinter + 背景 asyncio。EventSub 聽開台，streamlink + FFmpeg 抽幀，dHash 比對待命畫面，正片開始後打 Discord Webhook。
 

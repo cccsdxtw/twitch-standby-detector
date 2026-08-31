@@ -55,6 +55,7 @@ FONT = ("Microsoft JhengHei UI", 10)
 FONT_BOLD = ("Microsoft JhengHei UI", 11, "bold")
 FONT_TITLE = ("Microsoft JhengHei UI", 12, "bold")
 FONT_LOG = ("Microsoft JhengHei UI", 10)
+FONT_SMALL = ("Microsoft JhengHei UI", 9)
 
 
 def apply_root(root: tk.Tk) -> None:
@@ -1840,6 +1841,7 @@ async def monitor_broadcast(
     already_live: bool,
     pref: ChannelPref | None = None,
     started_at: datetime | None = None,
+    on_phase: Callable[[str], None] | None = None,
 ) -> bool:
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
@@ -1851,6 +1853,8 @@ async def monitor_broadcast(
             f"ℹ️ [{broadcaster}] 開台已超過 {skip_start_after_label(settings.skip_start_after_min)}，"
             "不再偵測開頭／正片。"
         )
+        if on_phase:
+            on_phase("skipped")
         return False
 
     pref = pref or ChannelPref(login=broadcaster)
@@ -1876,6 +1880,8 @@ async def monitor_broadcast(
             f"ℹ️ [{broadcaster}] 啟動時已在直播且沒有 standby/{broadcaster}.png，"
             "略過自動判定（避免把正片誤當成待命）。"
         )
+        if on_phase:
+            on_phase("live")
         return False
     else:
         log(
@@ -1909,6 +1915,7 @@ async def monitor_broadcast(
             ignore_color=ignore_color,
             ignore_tolerance=ignore_tolerance,
             started_at=started_at,
+            on_phase=on_phase,
         )
     except asyncio.CancelledError:
         raise
@@ -2077,6 +2084,7 @@ async def _watch_frames(
     ignore_color: tuple[int, int, int] | None,
     ignore_tolerance: int,
     started_at: datetime | None = None,
+    on_phase: Callable[[str], None] | None = None,
 ) -> bool:
     detector = StandbyDetector(refs, threshold, settings.confirm_frames)
     started = time.monotonic()
@@ -2104,6 +2112,8 @@ async def _watch_frames(
                     f"ℹ️ [{login}] 開台已超過 {skip_start_after_label(settings.skip_start_after_min)}，"
                     "停止偵測開頭／正片。"
                 )
+                if on_phase:
+                    on_phase("skipped")
                 return False
 
             try:
@@ -2219,7 +2229,23 @@ async def _kill_all(procs: list[asyncio.subprocess.Process]) -> None:
 
 # === app ===
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
+
+ROW_PHASES: dict[str, tuple[str, str]] = {
+    "idle": ("未監控", MUTED),
+    "listening": ("聽開台中", BLUE),
+    "detecting": ("偵測開頭中", ORANGE),
+    "skipped": ("已略過開頭", WARN),
+    "live": ("直播中", GREEN),
+    "main": ("正片已開始", OK),
+    "offline": ("已關台", MUTED),
+    "failed": ("偵測失敗", ERR),
+    "unsubscribed": ("這次不聽", WARN),
+}
+
+
+def row_phase_style(phase: str) -> tuple[str, str]:
+    return ROW_PHASES.get(phase, ROW_PHASES["idle"])
 
 
 class ChannelRow:
@@ -2243,18 +2269,30 @@ class ChannelRow:
 
         self._avatar_photo = None
         self.avatar_label = tk.Label(self.frame, bg=PANEL, width=3)
-        self.avatar_label.pack(side=tk.LEFT, padx=(0, 4))
+        self.avatar_label.pack(side=tk.LEFT, padx=(0, 4), anchor="n")
 
+        identity = tk.Frame(self.frame, bg=PANEL)
+        identity.pack(side=tk.LEFT, padx=(0, 8), anchor="n")
         self.name_var = tk.StringVar(value=pref.display_name.strip())
         self.name_label = tk.Label(
-            self.frame,
+            identity,
             textvariable=self.name_var,
             anchor="w",
             bg=PANEL,
             fg=MUTED,
             font=FONT_BOLD,
         )
-        self.name_label.pack(side=tk.LEFT, padx=(0, 8))
+        self.name_label.pack(anchor="w")
+        self.phase = "idle"
+        self.phase_label = tk.Label(
+            identity,
+            text=ROW_PHASES["idle"][0],
+            anchor="w",
+            bg=PANEL,
+            fg=ROW_PHASES["idle"][1],
+            font=FONT_SMALL,
+        )
+        self.phase_label.pack(anchor="w")
         self._named_login = pref.login.lower() if pref.display_name.strip() else ""
         self.refresh_avatar()
 
@@ -2438,6 +2476,11 @@ class ChannelRow:
         self.refresh_avatar()
         self.app._schedule_name_lookup((login,))
         self.app._persist_watchlist()
+
+    def set_phase(self, phase: str) -> None:
+        self.phase = phase if phase in ROW_PHASES else "idle"
+        text, color = row_phase_style(self.phase)
+        self.phase_label.config(text=text, fg=color)
 
     def refresh_status(self) -> None:
         name = self.login()
@@ -2673,7 +2716,7 @@ class StreamMonitorApp:
         watch.pack(fill=tk.X, padx=14, pady=6)
         label(
             watch,
-            "每台可調「像待命」相似度（預設 60%）、略過標題等會變的顏色，並指定待命圖片或影片。開網頁／關網頁分開勾。EventSub 預算 10：只聽開台每台 1，再勾關網頁 +1。名稱太長時可左右拖動這一列，以免看不到移除。",
+            "每台可調「像待命」相似度（預設 60%）、略過標題等會變的顏色，並指定待命圖片或影片。開網頁／關網頁分開勾。EventSub 預算 10：只聽開台每台 1，再勾關網頁 +1。顯示名稱下方是這台目前狀態（顏色不同）。名稱太長時可左右拖動這一列，以免看不到移除。",
         ).pack(fill=tk.X, pady=(0, 6))
         self.eventsub_budget = tk.Label(
             watch, text="", anchor="w", bg=PANEL, fg=MUTED, font=FONT
@@ -2904,6 +2947,32 @@ class StreamMonitorApp:
         self.stop_btn.config(state=tk.DISABLED)
         self._set_rows_enabled(True)
         self.set_run_status("狀態：已停止")
+        self._set_all_phases("idle")
+
+    def _row_for_login(self, login: str) -> ChannelRow | None:
+        handle = (login or "").strip().lower()
+        for row in self.rows:
+            if row.login() == handle:
+                return row
+        return None
+
+    def _apply_phase(self, login: str, phase: str) -> None:
+        row = self._row_for_login(login)
+        if row:
+            row.set_phase(phase)
+
+    def _set_phase(self, login: str, phase: str) -> None:
+        self.root.after(0, lambda lg=login, ph=phase: self._apply_phase(lg, ph))
+
+    def _set_all_phases(self, phase: str) -> None:
+        for row in self.rows:
+            if row.login():
+                row.set_phase(phase)
+
+    def _fail_if_detecting(self, login: str) -> None:
+        row = self._row_for_login(login)
+        if row and row.phase == "detecting":
+            row.set_phase("failed")
 
     def start_system(self) -> None:
         logins = self._logins_from_ui()
@@ -2922,6 +2991,14 @@ class StreamMonitorApp:
         self.start_btn.config(state=tk.DISABLED, text="監控運行中...")
         self.stop_btn.config(state=tk.NORMAL)
         self.set_run_status("狀態：監控中")
+        for row in self.rows:
+            login = row.login()
+            if not login:
+                continue
+            if login in plan.skipped:
+                row.set_phase("unsubscribed")
+            else:
+                row.set_phase("listening")
         self.log("☑️ 系統啟動，準備進入背景執行緒...")
         self.log(f"👀 將監看：{', '.join(logins)}")
         threading.Thread(target=self.run_asyncio_loop, daemon=True).start()
@@ -3165,17 +3242,20 @@ class StreamMonitorApp:
         pref = self._active_prefs.get(login) or ChannelPref(login=login)
         if not pref.notify_start:
             self.log(f"ℹ️ [{login}] 開始通知已關閉，不抽幀判定")
+            self._set_phase(login, "live")
             return
         if should_skip_start_detect(started_at, settings.skip_start_after_min):
             self.log(
                 f"ℹ️ [{login}] 開台已超過 {skip_start_after_label(settings.skip_start_after_min)}，"
                 "不再偵測開頭／正片"
             )
+            self._set_phase(login, "skipped")
             return
         existing = self._monitor_tasks.get(login)
         if existing and not existing.done():
             self.log(f"ℹ️ {login} 已在監控中，略過重複啟動")
             return
+        self._set_phase(login, "detecting")
         self._monitor_tasks[login] = asyncio.create_task(
             self._monitor_wrapper(
                 login,
@@ -3200,6 +3280,7 @@ class StreamMonitorApp:
     async def _channel_went_offline(self, login: str) -> None:
         name = self._display_names.get(login, login)
         self.log(f"⚫ {name} ({login}) 關台了")
+        self._set_phase(login, "offline")
         self._cancel_monitor(login)
         pref = self._active_prefs.get(login) or ChannelPref(login=login)
         if not pref.close_watch:
@@ -3244,17 +3325,22 @@ class StreamMonitorApp:
                     already_live=already_live,
                     pref=self._active_prefs.get(login) or ChannelPref(login=login),
                     started_at=started_at,
+                    on_phase=lambda ph, lg=login: self._set_phase(lg, ph),
                 )
-            if started and not stop_event.is_set():
-                pref = self._active_prefs.get(login) or ChannelPref(login=login)
-                if pref.notify_start:
-                    display = self._display_names.get(login, login)
-                    await send_webhook(
-                        settings.discord_webhook_url,
-                        build_start_message(display, login),
-                        client=http,
-                        log=self.log,
-                    )
+            if started:
+                self._set_phase(login, "main")
+                if not stop_event.is_set():
+                    pref = self._active_prefs.get(login) or ChannelPref(login=login)
+                    if pref.notify_start:
+                        display = self._display_names.get(login, login)
+                        await send_webhook(
+                            settings.discord_webhook_url,
+                            build_start_message(display, login),
+                            client=http,
+                            log=self.log,
+                        )
+            elif not stop_event.is_set():
+                self.root.after(0, lambda lg=login: self._fail_if_detecting(lg))
         except asyncio.CancelledError:
             self.log(f"[{login}] 監控任務已取消")
         finally:
