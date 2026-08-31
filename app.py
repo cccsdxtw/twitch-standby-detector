@@ -20,7 +20,7 @@ import urllib.request
 import webbrowser
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -435,6 +435,7 @@ class Settings:
     ad_skip_sec: float
     confirm_frames: int
     hash_threshold: int
+    skip_start_after_min: int
 
     @property
     def ready_for_eventsub(self) -> bool:
@@ -626,6 +627,83 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+DEFAULT_SKIP_START_AFTER_MIN = 60
+SKIP_START_AFTER_CHOICES: tuple[tuple[int, str], ...] = (
+    (0, "不略過"),
+    (30, "30 分鐘"),
+    (60, "1 小時"),
+    (120, "2 小時"),
+    (180, "3 小時"),
+    (360, "6 小時"),
+)
+
+
+def clamp_skip_start_after_min(
+    value: object, default: int = DEFAULT_SKIP_START_AFTER_MIN
+) -> int:
+    try:
+        minutes = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if minutes < 0:
+        return default
+    return min(minutes, 24 * 60)
+
+
+def skip_start_after_label(minutes: int) -> str:
+    minutes = clamp_skip_start_after_min(minutes)
+    for value, text in SKIP_START_AFTER_CHOICES:
+        if value == minutes:
+            return text
+    if minutes == 0:
+        return "不略過"
+    if minutes % 60 == 0:
+        hours = minutes // 60
+        return f"{hours} 小時"
+    return f"{minutes} 分鐘"
+
+
+def parse_helix_time(raw: object) -> datetime | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def stream_live_for_seconds(
+    started_at: datetime | None, *, now: datetime | None = None
+) -> float | None:
+    if started_at is None:
+        return None
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return max(0.0, (current - started_at.astimezone(timezone.utc)).total_seconds())
+
+
+def should_skip_start_detect(
+    started_at: datetime | None,
+    skip_after_min: int,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    limit = clamp_skip_start_after_min(skip_after_min)
+    if limit <= 0:
+        return False
+    age = stream_live_for_seconds(started_at, now=now)
+    if age is None:
+        return False
+    return age >= limit * 60
+
+
 def load_settings() -> Settings:
     load_dotenv(env_path(), override=True)
 
@@ -648,6 +726,9 @@ def load_settings() -> Settings:
         ad_skip_sec=max(_env_float("AD_SKIP_SEC", 20.0), 0.0),
         confirm_frames=max(_env_int("CONFIRM_FRAMES", 4), 1),
         hash_threshold=max(_env_int("HASH_THRESHOLD", 16), 1),
+        skip_start_after_min=clamp_skip_start_after_min(
+            os.getenv("SKIP_START_AFTER_MIN", str(DEFAULT_SKIP_START_AFTER_MIN))
+        ),
     )
 
 
@@ -1327,15 +1408,16 @@ async def helix_token_for_lookup(
     return token if response.status_code < 400 and token else ""
 
 
-async def live_user_ids(
+async def live_streams(
     client: httpx.AsyncClient,
     client_id: str,
     access_token: str,
     user_ids: list[str],
-) -> set[str]:
+) -> dict[str, datetime | None]:
+    """user_id -> started_at（Helix）。"""
     if not user_ids:
-        return set()
-    live: set[str] = set()
+        return {}
+    live: dict[str, datetime | None] = {}
     for index in range(0, len(user_ids), 100):
         chunk = user_ids[index : index + 100]
         params = [("user_id", uid) for uid in chunk]
@@ -1349,8 +1431,21 @@ async def live_user_ids(
         for row in payload.get("data") or []:
             uid = str(row.get("user_id", ""))
             if uid:
-                live.add(uid)
+                live[uid] = parse_helix_time(row.get("started_at"))
     return live
+
+
+async def live_user_ids(
+    client: httpx.AsyncClient,
+    client_id: str,
+    access_token: str,
+    user_ids: list[str],
+) -> set[str]:
+    return set(
+        (
+            await live_streams(client, client_id, access_token, user_ids)
+        ).keys()
+    )
 
 
 async def create_eventsub_subscription(
@@ -1747,10 +1842,18 @@ async def monitor_broadcast(
     *,
     already_live: bool,
     pref: ChannelPref | None = None,
+    started_at: datetime | None = None,
 ) -> bool:
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         log("❌ 找不到 ffmpeg。請安裝 FFmpeg 並加入 PATH，或把 ffmpeg.exe 放到程式同一個資料夾。")
+        return False
+
+    if should_skip_start_detect(started_at, settings.skip_start_after_min):
+        log(
+            f"ℹ️ [{broadcaster}] 開台已超過 {skip_start_after_label(settings.skip_start_after_min)}，"
+            "不再偵測開頭／正片。"
+        )
         return False
 
     pref = pref or ChannelPref(login=broadcaster)
@@ -1808,6 +1911,7 @@ async def monitor_broadcast(
             similarity_pct=similarity_pct,
             ignore_color=ignore_color,
             ignore_tolerance=ignore_tolerance,
+            started_at=started_at,
         )
     except asyncio.CancelledError:
         raise
@@ -1975,6 +2079,7 @@ async def _watch_frames(
     similarity_pct: int,
     ignore_color: tuple[int, int, int] | None,
     ignore_tolerance: int,
+    started_at: datetime | None = None,
 ) -> bool:
     detector = StandbyDetector(refs, threshold, settings.confirm_frames)
     started = time.monotonic()
@@ -1995,6 +2100,13 @@ async def _watch_frames(
                         extras.extend(task.result()[-6:])
                 detail = " | ".join(extras) if extras else f"exit={dead[0].returncode}"
                 log(f"❌ [{login}] 抽幀行程結束：{detail}")
+                return False
+
+            if should_skip_start_detect(started_at, settings.skip_start_after_min):
+                log(
+                    f"ℹ️ [{login}] 開台已超過 {skip_start_after_label(settings.skip_start_after_min)}，"
+                    "停止偵測開頭／正片。"
+                )
                 return False
 
             try:
@@ -2438,7 +2550,7 @@ class SettingsWindow(tk.Toplevel):
         super().__init__(app.root)
         self.app = app
         self.title("修改設定")
-        self.geometry("560x360")
+        self.geometry("560x460")
         self.configure(bg=BG)
         self.transient(app.root)
         current = load_settings()
@@ -2457,6 +2569,19 @@ class SettingsWindow(tk.Toplevel):
             box, "Discord Webhook 網址", current.discord_webhook_url, ""
         )
 
+        label(box, "開台超過多久就不再偵測開頭（正片開始）").pack(fill=tk.X, pady=(8, 0))
+        labels = [text for _value, text in SKIP_START_AFTER_CHOICES]
+        current_label = skip_start_after_label(current.skip_start_after_min)
+        if current_label not in labels:
+            labels = [*labels, current_label]
+        self.skip_start_var = tk.StringVar(value=current_label)
+        tk.OptionMenu(box, self.skip_start_var, *labels).pack(fill=tk.X, pady=(2, 4))
+        label(
+            box,
+            "預設 1 小時。剛開台仍會偵測；啟動時已播很久或開台超過此時長就停抽幀。選「不略過」則一直偵測。",
+            fg=MUTED,
+        ).pack(anchor="w", pady=(0, 8))
+
         label(
             box,
             "Client ID：Twitch 開發者主控台 → 應用程式 → 管理\n"
@@ -2474,6 +2599,14 @@ class SettingsWindow(tk.Toplevel):
         widget.insert(0, value)
         return widget
 
+    def _skip_start_minutes(self) -> int:
+        chosen = self.skip_start_var.get().strip()
+        for minutes, text in SKIP_START_AFTER_CHOICES:
+            if text == chosen:
+                return minutes
+        digits = "".join(ch for ch in chosen if ch.isdigit())
+        return clamp_skip_start_after_min(digits or DEFAULT_SKIP_START_AFTER_MIN)
+
     def _save(self) -> None:
         try:
             upsert_env_values(
@@ -2481,13 +2614,14 @@ class SettingsWindow(tk.Toplevel):
                     "TWITCH_CLIENT_ID": self.client_id.get().strip(),
                     "TWITCH_CLIENT_SECRET": self.client_secret.get().strip(),
                     "DISCORD_WEBHOOK_URL": self.webhook.get().strip(),
+                    "SKIP_START_AFTER_MIN": str(self._skip_start_minutes()),
                 }
             )
         except OSError as exc:
             self.app.log(f"❌ 設定儲存失敗：{exc}")
             return
         self.app.refresh_settings_status()
-        self.app.log("✅ 設定已儲存。下次按啟動就會用新的 ID / Webhook。")
+        self.app.log("✅ 設定已儲存。下次按啟動就會用新的 ID / Webhook／開頭偵測時限。")
         self.destroy()
 
 
@@ -2589,7 +2723,10 @@ class StreamMonitorApp:
         settings = load_settings()
         client = "已填" if settings.twitch_client_id else "未填"
         hook = "已填" if settings.discord_webhook_url else "未填"
-        self.settings_status.config(text=f"Client ID：{client}　Discord：{hook}")
+        skip = skip_start_after_label(settings.skip_start_after_min)
+        self.settings_status.config(
+            text=f"Client ID：{client}　Discord：{hook}　開頭偵測：{skip}"
+        )
 
     def set_run_status(self, text: str, *, ok: bool = True) -> None:
         color = OK if ok else RED
@@ -2898,13 +3035,13 @@ class StreamMonitorApp:
                 for login in plan.included
             }
             skipped = list(plan.skipped)
-            live_ids = await live_user_ids(
+            live_started = await live_streams(
                 http,
                 settings.twitch_client_id,
                 token.access_token,
                 list(user_ids.values()),
             )
-            for uid in live_ids:
+            for uid, started_at in live_started.items():
                 login = id_to_login.get(uid)
                 if login:
                     await self._channel_went_live(
@@ -2914,6 +3051,7 @@ class StreamMonitorApp:
                         stop_event,
                         source="啟動掃描",
                         already_live=True,
+                        started_at=started_at,
                     )
 
             async def on_event(event_type: str, event: dict) -> None:
@@ -2941,6 +3079,7 @@ class StreamMonitorApp:
                         stop_event,
                         source="EventSub",
                         already_live=False,
+                        started_at=parse_helix_time(event.get("started_at")),
                     )
                 elif event_type == "stream.offline":
                     await self._channel_went_offline(login)
@@ -2975,6 +3114,7 @@ class StreamMonitorApp:
         *,
         source: str,
         already_live: bool,
+        started_at: datetime | None = None,
     ) -> None:
         existing = self._monitor_tasks.get(login)
         if existing and not existing.done():
@@ -2997,7 +3137,12 @@ class StreamMonitorApp:
         if pref.open_watch:
             await self._open_watch_page(login)
         await self._start_monitor(
-            login, settings, http, stop_event, already_live=already_live
+            login,
+            settings,
+            http,
+            stop_event,
+            already_live=already_live,
+            started_at=started_at,
         )
 
     async def _start_monitor(
@@ -3007,10 +3152,17 @@ class StreamMonitorApp:
         http: httpx.AsyncClient,
         stop_event: asyncio.Event,
         already_live: bool = False,
+        started_at: datetime | None = None,
     ) -> None:
         pref = self._active_prefs.get(login) or ChannelPref(login=login)
         if not pref.notify_start:
             self.log(f"ℹ️ [{login}] 開始通知已關閉，不抽幀判定")
+            return
+        if should_skip_start_detect(started_at, settings.skip_start_after_min):
+            self.log(
+                f"ℹ️ [{login}] 開台已超過 {skip_start_after_label(settings.skip_start_after_min)}，"
+                "不再偵測開頭／正片"
+            )
             return
         existing = self._monitor_tasks.get(login)
         if existing and not existing.done():
@@ -3018,7 +3170,12 @@ class StreamMonitorApp:
             return
         self._monitor_tasks[login] = asyncio.create_task(
             self._monitor_wrapper(
-                login, settings, http, stop_event, already_live=already_live
+                login,
+                settings,
+                http,
+                stop_event,
+                already_live=already_live,
+                started_at=started_at,
             )
         )
 
@@ -3065,6 +3222,7 @@ class StreamMonitorApp:
         http: httpx.AsyncClient,
         stop_event: asyncio.Event,
         already_live: bool = False,
+        started_at: datetime | None = None,
     ) -> None:
         try:
             if settings.simulate:
@@ -3077,6 +3235,7 @@ class StreamMonitorApp:
                     stop_event,
                     already_live=already_live,
                     pref=self._active_prefs.get(login) or ChannelPref(login=login),
+                    started_at=started_at,
                 )
             if started and not stop_event.is_set():
                 pref = self._active_prefs.get(login) or ChannelPref(login=login)

@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from PIL import Image
@@ -22,7 +23,11 @@ from app import (
     event_from_notification,
     get_resource_path,
     load_channel_prefs,
+    parse_helix_time,
     parse_ignore_color,
+    should_skip_start_detect,
+    clamp_skip_start_after_min,
+    skip_start_after_label,
     parse_logins,
     plan_eventsub,
     eventsub_cost,
@@ -238,6 +243,37 @@ class WatchlistPrefTests(unittest.TestCase):
         self.assertIn("json/close/abc-1", cdp_close_tab_url("abc-1"))
         self.assertEqual(parse_cdp_target_id({"id": "tab-9"}), "tab-9")
         self.assertEqual(parse_cdp_target_id({}), "")
+
+
+class SkipStartDetectTests(unittest.TestCase):
+    def test_parse_helix_zulu(self) -> None:
+        parsed = parse_helix_time("2026-08-30T12:00:00Z")
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.tzinfo, timezone.utc)
+        self.assertEqual(parsed.hour, 12)
+
+    def test_skip_after_one_hour_default(self) -> None:
+        started = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+        now = started + timedelta(minutes=59)
+        self.assertFalse(should_skip_start_detect(started, 60, now=now))
+        now = started + timedelta(hours=1)
+        self.assertTrue(should_skip_start_detect(started, 60, now=now))
+
+    def test_zero_means_never_skip(self) -> None:
+        started = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+        now = started + timedelta(hours=8)
+        self.assertFalse(should_skip_start_detect(started, 0, now=now))
+
+    def test_unknown_start_not_skipped(self) -> None:
+        self.assertFalse(should_skip_start_detect(None, 60))
+
+    def test_clamp_and_label(self) -> None:
+        self.assertEqual(clamp_skip_start_after_min("60"), 60)
+        self.assertEqual(clamp_skip_start_after_min("-3"), 60)
+        self.assertEqual(clamp_skip_start_after_min("x"), 60)
+        self.assertEqual(skip_start_after_label(60), "1 小時")
+        self.assertEqual(skip_start_after_label(0), "不略過")
 
 
 class SimilarityTests(unittest.TestCase):
