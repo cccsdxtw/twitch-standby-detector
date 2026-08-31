@@ -704,6 +704,59 @@ def _fmt_setting_number(value: float) -> str:
     return str(value)
 
 
+SETTING_INT_RE = re.compile(r"^\d+$")
+SETTING_NUM_RE = re.compile(r"^\d+(?:\.\d+)?$")
+SETTING_CLIENT_RE = re.compile(r"^[A-Za-z0-9]{6,}$")
+SETTING_SECRET_RE = re.compile(r"^[A-Za-z0-9._-]{6,}$")
+SETTING_WEBHOOK_RE = re.compile(
+    r"^https://(?:ptb\.|canary\.)?(?:discord|discordapp)\.com/api/webhooks/\d+/\S+$",
+    re.IGNORECASE,
+)
+
+
+def setting_looks_like_client_id(raw: str) -> bool:
+    text = (raw or "").strip()
+    return (not text) or bool(SETTING_CLIENT_RE.fullmatch(text))
+
+
+def setting_looks_like_secret(raw: str) -> bool:
+    text = (raw or "").strip()
+    return (not text) or bool(SETTING_SECRET_RE.fullmatch(text))
+
+
+def setting_looks_like_webhook(raw: str) -> bool:
+    text = (raw or "").strip()
+    return (not text) or bool(SETTING_WEBHOOK_RE.fullmatch(text))
+
+
+def setting_looks_like_nonneg_int(raw: str) -> bool:
+    text = (raw or "").strip()
+    return (not text) or bool(SETTING_INT_RE.fullmatch(text))
+
+
+def setting_looks_like_nonneg_number(raw: str) -> bool:
+    text = (raw or "").strip()
+    return (not text) or bool(SETTING_NUM_RE.fullmatch(text))
+
+
+def setting_looks_like_frame_interval(raw: str) -> bool:
+    text = (raw or "").strip()
+    if not text:
+        return True
+    if not SETTING_NUM_RE.fullmatch(text):
+        return False
+    return 0.5 <= float(text) <= 10.0
+
+
+def setting_looks_like_confirm_frames(raw: str) -> bool:
+    text = (raw or "").strip()
+    if not text:
+        return True
+    if not SETTING_INT_RE.fullmatch(text):
+        return False
+    return 1 <= int(text) <= 10
+
+
 def skip_start_hms(minutes: int) -> tuple[int, int]:
     minutes = clamp_skip_start_after_min(minutes)
     return minutes // 60, minutes % 60
@@ -2719,6 +2772,7 @@ class SettingsWindow(tk.Toplevel):
         self._nav_btns: dict[str, tk.Button] = {}
         self._active_page = ""
         self._template_focus: tk.Text | None = None
+        self._checks: list[tuple[str, Callable[[], bool]]] = []
 
         body = tk.Frame(self, bg=BG)
         body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 0))
@@ -2742,19 +2796,36 @@ class SettingsWindow(tk.Toplevel):
             anchor="w", pady=(0, 8)
         )
         self.client_id = self._field(
-            call_page, "Twitch Client ID", current.twitch_client_id, ""
+            call_page,
+            "Twitch Client ID",
+            current.twitch_client_id,
+            "",
+            page="呼叫設定",
+            validator=setting_looks_like_client_id,
         )
         self.client_secret = self._field(
-            call_page, "Twitch Client Secret（可空）", current.twitch_client_secret, "*"
+            call_page,
+            "Twitch Client Secret（可空）",
+            current.twitch_client_secret,
+            "*",
+            page="呼叫設定",
+            validator=setting_looks_like_secret,
         )
         self.webhook = self._field(
-            call_page, "Discord Webhook 網址（主／開台）", current.discord_webhook_url, ""
+            call_page,
+            "Discord Webhook 網址（主／開台）",
+            current.discord_webhook_url,
+            "",
+            page="呼叫設定",
+            validator=setting_looks_like_webhook,
         )
         self.webhook_start = self._field(
             call_page,
             "Discord Webhook 網址（輔助／正片，可空）",
             current.discord_webhook_start_url,
             "",
+            page="呼叫設定",
+            validator=setting_looks_like_webhook,
         )
         label(
             call_page,
@@ -2769,14 +2840,28 @@ class SettingsWindow(tk.Toplevel):
         hours, mins = skip_start_hms(current.skip_start_after_min)
         skip_row = tk.Frame(time_page, bg=PANEL)
         skip_row.pack(fill=tk.X, pady=(0, 4))
-        tk.Label(skip_row, text="小時", bg=PANEL, fg=FG, font=FONT).pack(side=tk.LEFT)
+        hours_lbl = tk.Label(skip_row, text="小時", bg=PANEL, fg=FG, font=FONT)
+        hours_lbl.pack(side=tk.LEFT)
         self.skip_hours = entry(skip_row, None, width=6)
         self.skip_hours.pack(side=tk.LEFT, padx=(6, 12))
         self.skip_hours.insert(0, str(hours))
-        tk.Label(skip_row, text="分鐘", bg=PANEL, fg=FG, font=FONT).pack(side=tk.LEFT)
+        self._watch_value(
+            "時間設定",
+            self.skip_hours,
+            setting_looks_like_nonneg_int,
+            hours_lbl,
+        )
+        mins_lbl = tk.Label(skip_row, text="分鐘", bg=PANEL, fg=FG, font=FONT)
+        mins_lbl.pack(side=tk.LEFT)
         self.skip_mins = entry(skip_row, None, width=6)
         self.skip_mins.pack(side=tk.LEFT, padx=(6, 0))
         self.skip_mins.insert(0, str(mins))
+        self._watch_value(
+            "時間設定",
+            self.skip_mins,
+            setting_looks_like_nonneg_int,
+            mins_lbl,
+        )
         label(
             time_page,
             "例如 0 小時 46 分，或 1 小時 20 分。剛開台仍會偵測；超過此時長就停抽幀。",
@@ -2790,18 +2875,24 @@ class SettingsWindow(tk.Toplevel):
             "開台後略過秒數（廣告／過場）",
             _fmt_setting_number(current.ad_skip_sec),
             "",
+            page="時間設定",
+            validator=setting_looks_like_nonneg_number,
         )
         self.frame_interval = self._field(
             time_page,
             "抽幀間隔秒數（0.5–10）",
             _fmt_setting_number(current.frame_interval_sec),
             "",
+            page="時間設定",
+            validator=setting_looks_like_frame_interval,
         )
         self.confirm_frames = self._field(
             time_page,
             "連續幾張不像待命才通知（1–10）",
             str(current.confirm_frames),
             "",
+            page="時間設定",
+            validator=setting_looks_like_confirm_frames,
         )
 
         label(
@@ -2850,6 +2941,9 @@ class SettingsWindow(tk.Toplevel):
             btn.pack(fill=tk.X, pady=(0, 6))
             self._nav_btns[title] = btn
 
+        label(self, "紅字＝這格填錯了（負數、中文、英文亂碼或符號）。改對才能儲存。", fg=MUTED).pack(
+            fill=tk.X, padx=10, pady=(8, 0)
+        )
         color_button(self, "💾  儲存套用", self._save, ORANGE).pack(
             fill=tk.X, padx=10, pady=10
         )
@@ -2866,14 +2960,52 @@ class SettingsWindow(tk.Toplevel):
             else:
                 btn.config(bg=PANEL, fg=FG)
 
-    def _field(self, parent: tk.Widget, title: str, value: str, show: str) -> tk.Entry:
+    def _field(
+        self,
+        parent: tk.Widget,
+        title: str,
+        value: str,
+        show: str,
+        *,
+        page: str,
+        validator,
+    ) -> tk.Entry:
         box = tk.Frame(parent, bg=PANEL)
         box.pack(fill=tk.X, pady=4)
-        label(box, title).pack(fill=tk.X)
+        title_lbl = label(box, title)
+        title_lbl.pack(fill=tk.X)
         widget = entry(box, None, show=show)
         widget.pack(fill=tk.X)
         widget.insert(0, value)
+        self._watch_value(page, widget, validator, title_lbl)
         return widget
+
+    def _watch_value(
+        self,
+        page: str,
+        widget: tk.Entry,
+        validator,
+        title_lbl: tk.Label,
+    ) -> None:
+        def refresh(_event=None) -> bool:
+            ok = bool(validator(widget.get()))
+            color = FG if ok else ERR
+            try:
+                widget.config(fg=color)
+                title_lbl.config(fg=color)
+            except tk.TclError:
+                pass
+            return ok
+
+        widget.bind("<KeyRelease>", refresh, add="+")
+        widget.bind("<FocusOut>", refresh, add="+")
+        self._checks.append((page, refresh))
+
+    def _first_invalid_page(self) -> str:
+        for page, refresh in self._checks:
+            if not refresh():
+                return page
+        return ""
 
     def _text_field(self, parent: tk.Widget, title: str, value: str) -> tk.Text:
         box = tk.Frame(parent, bg=PANEL)
@@ -2920,6 +3052,11 @@ class SettingsWindow(tk.Toplevel):
         return clamp_skip_start_after_min(hours * 60 + mins)
 
     def _save(self) -> None:
+        bad_page = self._first_invalid_page()
+        if bad_page:
+            self._show_page(bad_page)
+            self.app.log("⚠️ 紅字欄位填錯了，改成數字或正確網址後再儲存。")
+            return
         try:
             upsert_env_values(
                 {

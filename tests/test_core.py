@@ -34,6 +34,13 @@ from app import (
     clamp_confirm_frames,
     skip_start_hms,
     skip_start_after_label,
+    setting_looks_like_client_id,
+    setting_looks_like_confirm_frames,
+    setting_looks_like_frame_interval,
+    setting_looks_like_nonneg_int,
+    setting_looks_like_nonneg_number,
+    setting_looks_like_secret,
+    setting_looks_like_webhook,
     parse_logins,
     plan_eventsub,
     eventsub_cost,
@@ -379,6 +386,36 @@ class SkipStartDetectTests(unittest.TestCase):
         self.assertEqual(clamp_frame_interval_sec("12"), 10.0)
         self.assertEqual(clamp_confirm_frames("0"), 1)
         self.assertEqual(clamp_confirm_frames("99"), 10)
+
+
+class SettingGuardTests(unittest.TestCase):
+    def test_numbers_reject_junk(self) -> None:
+        self.assertTrue(setting_looks_like_nonneg_int("0"))
+        self.assertTrue(setting_looks_like_nonneg_int(""))
+        self.assertFalse(setting_looks_like_nonneg_int("-1"))
+        self.assertFalse(setting_looks_like_nonneg_int("一小時"))
+        self.assertFalse(setting_looks_like_nonneg_int("ab"))
+        self.assertFalse(setting_looks_like_nonneg_int("1.5"))
+        self.assertFalse(setting_looks_like_nonneg_number("-3"))
+        self.assertTrue(setting_looks_like_nonneg_number("20.5"))
+        self.assertFalse(setting_looks_like_frame_interval("0.2"))
+        self.assertTrue(setting_looks_like_frame_interval("0.5"))
+        self.assertFalse(setting_looks_like_confirm_frames("0"))
+        self.assertTrue(setting_looks_like_confirm_frames("4"))
+
+    def test_ids_and_webhook(self) -> None:
+        self.assertTrue(setting_looks_like_client_id(""))
+        self.assertTrue(setting_looks_like_client_id("bqxb9v6k4nm6g0v45u50u5e3wg756z"))
+        self.assertFalse(setting_looks_like_client_id("有中文"))
+        self.assertFalse(setting_looks_like_secret("!!!"))
+        self.assertTrue(setting_looks_like_webhook(""))
+        self.assertTrue(
+            setting_looks_like_webhook(
+                "https://discord.com/api/webhooks/1/abc-token_1"
+            )
+        )
+        self.assertFalse(setting_looks_like_webhook("https://example.com/hook"))
+        self.assertFalse(setting_looks_like_webhook("不是網址"))
 
 
 class SimilarityTests(unittest.TestCase):
