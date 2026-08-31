@@ -272,7 +272,7 @@ class SkipStartDetectTests(unittest.TestCase):
         self.assertEqual(clamp_skip_start_after_min("60"), 60)
         self.assertEqual(clamp_skip_start_after_min("-3"), 60)
         self.assertEqual(clamp_skip_start_after_min("x"), 60)
-        self.assertEqual(skip_start_after_label(60), "1 小時")
+        self.assertEqual(skip_start_after_label(60), "60 分鐘")
         self.assertEqual(skip_start_after_label(0), "不略過")
 
 

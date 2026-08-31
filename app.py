@@ -628,14 +628,6 @@ def _env_int(name: str, default: int) -> int:
 
 
 DEFAULT_SKIP_START_AFTER_MIN = 60
-SKIP_START_AFTER_CHOICES: tuple[tuple[int, str], ...] = (
-    (0, "不略過"),
-    (30, "30 分鐘"),
-    (60, "1 小時"),
-    (120, "2 小時"),
-    (180, "3 小時"),
-    (360, "6 小時"),
-)
 
 
 def clamp_skip_start_after_min(
@@ -652,14 +644,8 @@ def clamp_skip_start_after_min(
 
 def skip_start_after_label(minutes: int) -> str:
     minutes = clamp_skip_start_after_min(minutes)
-    for value, text in SKIP_START_AFTER_CHOICES:
-        if value == minutes:
-            return text
     if minutes == 0:
         return "不略過"
-    if minutes % 60 == 0:
-        hours = minutes // 60
-        return f"{hours} 小時"
     return f"{minutes} 分鐘"
 
 
@@ -2568,17 +2554,15 @@ class SettingsWindow(tk.Toplevel):
         self.webhook = self._field(
             box, "Discord Webhook 網址", current.discord_webhook_url, ""
         )
-
-        label(box, "開台超過多久就不再偵測開頭（正片開始）").pack(fill=tk.X, pady=(8, 0))
-        labels = [text for _value, text in SKIP_START_AFTER_CHOICES]
-        current_label = skip_start_after_label(current.skip_start_after_min)
-        if current_label not in labels:
-            labels = [*labels, current_label]
-        self.skip_start_var = tk.StringVar(value=current_label)
-        tk.OptionMenu(box, self.skip_start_var, *labels).pack(fill=tk.X, pady=(2, 4))
+        self.skip_start = self._field(
+            box,
+            "開台超過幾分鐘就不再偵測開頭（0＝不略過，預設 60）",
+            str(current.skip_start_after_min),
+            "",
+        )
         label(
             box,
-            "預設 1 小時。剛開台仍會偵測；啟動時已播很久或開台超過此時長就停抽幀。選「不略過」則一直偵測。",
+            "剛開台仍會偵測；已播超過這個分鐘數就停抽幀、不打正片開始。",
             fg=MUTED,
         ).pack(anchor="w", pady=(0, 8))
 
@@ -2600,12 +2584,7 @@ class SettingsWindow(tk.Toplevel):
         return widget
 
     def _skip_start_minutes(self) -> int:
-        chosen = self.skip_start_var.get().strip()
-        for minutes, text in SKIP_START_AFTER_CHOICES:
-            if text == chosen:
-                return minutes
-        digits = "".join(ch for ch in chosen if ch.isdigit())
-        return clamp_skip_start_after_min(digits or DEFAULT_SKIP_START_AFTER_MIN)
+        return clamp_skip_start_after_min(self.skip_start.get().strip())
 
     def _save(self) -> None:
         try:

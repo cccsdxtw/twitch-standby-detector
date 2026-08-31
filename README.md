@@ -19,7 +19,7 @@ Twitch 待命畫面 / 正片切換監控。版本 **v0.11.0**。版本號避開 
 5. **強烈建議**把待命截圖放到 `standby/<登入名>.png`（例如 `standby/lanmeinotbeer.png`）。沒有參考圖時：剛開台會試著抓穩定 baseline；**啟動時已經在直播則略過判定**。
 6. 沒憑證試 UI：`SIMULATE=1`。
 
-可調：`FRAME_INTERVAL_SEC`（預設 3）、`AD_SKIP_SEC`（20）、`CONFIRM_FRAMES`（連續 4 張不像待命才通知）。**開頭偵測時限**在設定裡切換，預設開台滿 1 小時就不再抽幀判定正片（`SKIP_START_AFTER_MIN`，0＝不略過）。每台的相似度與略過色存在 `watchlist.json`。
+可調：`FRAME_INTERVAL_SEC`（預設 3）、`AD_SKIP_SEC`（20）、`CONFIRM_FRAMES`（連續 4 張不像待命才通知）。**開頭偵測時限**在設定裡填分鐘數，預設 60（開台滿 1 小時就不再抽幀判定正片；`SKIP_START_AFTER_MIN`，0＝不略過）。每台的相似度與略過色存在 `watchlist.json`。
 
 EventSub 預設只訂 `stream.online`（每台成本 1）。有勾關網頁的台才加 `stream.offline`。總預算 10，名單依序能塞多少聽多少。不做 Helix 輪詢。
 
