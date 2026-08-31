@@ -3,4 +3,6 @@ websockets>=12.0,<16
 python-dotenv>=1.0.0,<2
 streamlink>=6.5,<9
 Pillow>=10,<12
+pystray>=0.19,<1
+
 

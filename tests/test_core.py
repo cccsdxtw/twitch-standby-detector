@@ -22,6 +22,7 @@ from app import (
     clamp_similarity_pct,
     event_from_notification,
     get_resource_path,
+    load_tray_image,
     load_channel_prefs,
     parse_helix_time,
     parse_ignore_color,
@@ -47,6 +48,7 @@ from app import (
     write_avatar_bytes,
     row_phase_style,
     ROW_PHASES,
+    window_close_hides_to_tray,
 )
 
 
@@ -96,6 +98,18 @@ class PathsTests(unittest.TestCase):
 
     def test_app_dir_unfrozen(self) -> None:
         self.assertTrue(os.path.isdir(app_dir()))
+
+
+class TrayCloseTests(unittest.TestCase):
+    def test_close_hides_when_tray_ready(self) -> None:
+        self.assertTrue(window_close_hides_to_tray(True))
+        self.assertFalse(window_close_hides_to_tray(False))
+
+    def test_tray_image_is_rgba(self) -> None:
+        img = load_tray_image()
+        self.assertEqual(img.mode, "RGBA")
+        self.assertGreaterEqual(img.size[0], 16)
+        self.assertGreaterEqual(img.size[1], 16)
 
 
 class EventSubParseTests(unittest.TestCase):

@@ -1,6 +1,6 @@
 # 實況守門員
 
-Twitch 待命畫面 / 正片切換監控。版本 **v0.13.0**。版本號避開 4。
+Twitch 待命畫面 / 正片切換監控。版本 **v0.14.0**。版本號避開 4。
 
 桌面程式：Tkinter + 背景 asyncio。EventSub 聽開台，streamlink + FFmpeg 抽幀，dHash 比對待命畫面，正片開始後打 Discord Webhook。
 
@@ -29,13 +29,14 @@ EventSub 預設只訂 `stream.online`（每台成本 1）。有勾關網頁的�
 python app.py
 ```
 
-流程：登入 Twitch → 補查已在直播 → EventSub 開台 → 開台抽幀 → 離開待命 → Discord。
+流程：登入 Twitch → 補查已在直播 → EventSub 開台 → 開台抽幀 → 離開待命 → Discord。關視窗會縮到系統托盤，監看繼續；托盤圖示左鍵打開視窗、右鍵可結束程式。
 
 ## 用萬用 PyInstaller 打包神器
 
 邏輯都在 **`app.py` 一個檔**，直接拖進去即可（有 `import tkinter` → `-w`）。
 
-- 圖示：`get_resource_path("app_master_icon.ico")`
+- 圖示：`get_resource_path("app_master_icon.ico")`（視窗與系統托盤共用）
 - **FFmpeg 不會被打進 EXE**。把 `ffmpeg.exe` 放到 EXE 旁邊。
 - streamlink 資源較多；若 EXE 解析不到台，請改打包指令加上 `--collect-all streamlink`（萬用 bat 預設不會加）。
+- 系統托盤用 `pystray`。若 EXE 關窗就直接結束，打包時加上 `--hidden-import pystray`。
 - `.env`、`standby\` 截圖放 EXE 旁邊。

@@ -220,6 +220,25 @@ def get_resource_path(relative_path: str) -> str:
     return os.path.join(base, relative_path)
 
 
+def window_close_hides_to_tray(tray_ready: bool) -> bool:
+    """關視窗：有托盤就縮小繼續跑，沒有就結束程式。"""
+    return bool(tray_ready)
+
+
+def load_tray_image() -> Image.Image:
+    path = get_resource_path("app_master_icon.ico")
+    if os.path.isfile(path):
+        try:
+            with Image.open(path) as img:
+                frame = img.copy()
+            return frame.convert("RGBA")
+        except (OSError, UnidentifiedImageError):
+            pass
+    image = Image.new("RGBA", (64, 64), (30, 127, 224, 255))
+    ImageDraw.Draw(image).ellipse((10, 10, 54, 54), fill=(46, 139, 87, 255))
+    return image
+
+
 def avatar_cache_dir() -> str:
     path = os.path.join(app_dir(), "avatar_cache")
     os.makedirs(path, exist_ok=True)
@@ -2229,7 +2248,7 @@ async def _kill_all(procs: list[asyncio.subprocess.Process]) -> None:
 
 # === app ===
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 ROW_PHASES: dict[str, tuple[str, str]] = {
     "idle": ("未監控", MUTED),
@@ -2709,6 +2728,9 @@ class StreamMonitorApp:
         self._display_names: dict[str, str] = {}
         self._watch = WatchBrowser()
         self.rows: list[ChannelRow] = []
+        self._tray_icon = None
+        self._quitting = False
+        self._tray_hidden_once = False
 
         initial = load_settings()
         self.standby_dir = initial.standby_dir
@@ -2764,6 +2786,11 @@ class StreamMonitorApp:
         self.stop_btn = color_button(control, "■  停止監控", self.stop_system, RED)
         self.stop_btn.pack(fill=tk.X)
         self.stop_btn.config(state=tk.DISABLED)
+        label(
+            control,
+            "關閉視窗會縮到系統托盤，監看繼續。托盤圖示：左鍵打開、右鍵結束程式。",
+            fg=MUTED,
+        ).pack(fill=tk.X, pady=(6, 0))
 
         log_box = group(root, "近期事件日誌")
         log_box.pack(fill=tk.BOTH, expand=True, padx=14, pady=(6, 14))
@@ -2780,6 +2807,7 @@ class StreamMonitorApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self.process_queue)
+        self.root.after(200, self._start_tray)
 
     def open_settings(self) -> None:
         SettingsWindow(self)
@@ -3025,9 +3053,94 @@ class StreamMonitorApp:
         if loop is not None and event is not None:
             loop.call_soon_threadsafe(event.set)
 
+    def _start_tray(self) -> None:
+        if self._tray_icon is not None:
+            return
+        try:
+            import pystray
+        except ImportError:
+            self.log("ℹ️ 未安裝 pystray，關閉視窗會結束程式。可執行 pip install pystray")
+            return
+        try:
+            menu = pystray.Menu(
+                pystray.MenuItem(
+                    "打開視窗",
+                    lambda *_: self.root.after(0, self._restore_window),
+                    default=True,
+                ),
+                pystray.MenuItem(
+                    "結束程式",
+                    lambda *_: self.root.after(0, self._quit_app),
+                ),
+            )
+            icon = pystray.Icon(
+                "twitch-standby-detector",
+                load_tray_image(),
+                "實況守門員",
+                menu,
+            )
+            self._tray_icon = icon
+            threading.Thread(target=self._run_tray, daemon=True).start()
+        except Exception as exc:
+            self._tray_icon = None
+            self.log(f"⚠️ 系統托盤無法啟動：{exc}")
+
+    def _run_tray(self) -> None:
+        icon = self._tray_icon
+        if icon is None:
+            return
+        try:
+            icon.run()
+        except Exception as exc:
+            self._tray_icon = None
+            self.root.after(0, lambda: self.log(f"⚠️ 系統托盤已停止：{exc}"))
+
+    def _restore_window(self) -> None:
+        if self._quitting:
+            return
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:
+            return
+        try:
+            self.root.attributes("-topmost", True)
+            self.root.after(200, lambda: self.root.attributes("-topmost", False))
+        except tk.TclError:
+            pass
+
     def _on_close(self) -> None:
+        if window_close_hides_to_tray(self._tray_icon is not None) and not self._quitting:
+            self.root.withdraw()
+            if not self._tray_hidden_once:
+                self._tray_hidden_once = True
+                self.log("ℹ️ 已縮到系統托盤，監看繼續。左鍵打開視窗，右鍵可結束程式。")
+                icon = self._tray_icon
+                if icon is not None:
+                    try:
+                        icon.notify("實況守門員仍在背景監看", "實況守門員")
+                    except Exception:
+                        pass
+            return
+        self._quit_app()
+
+    def _quit_app(self) -> None:
+        if self._quitting:
+            return
+        self._quitting = True
         self.stop_system()
-        self.root.destroy()
+        icon = self._tray_icon
+        self._tray_icon = None
+        if icon is not None:
+            try:
+                icon.stop()
+            except Exception:
+                pass
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
     def run_asyncio_loop(self) -> None:
         loop = asyncio.new_event_loop()
