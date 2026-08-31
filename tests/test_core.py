@@ -29,6 +29,9 @@ from app import (
     parse_ignore_color,
     should_skip_start_detect,
     clamp_skip_start_after_min,
+    clamp_ad_skip_sec,
+    clamp_frame_interval_sec,
+    clamp_confirm_frames,
     skip_start_hms,
     skip_start_after_label,
     parse_logins,
@@ -369,6 +372,13 @@ class SkipStartDetectTests(unittest.TestCase):
         self.assertEqual(skip_start_after_label(0), "不略過")
         self.assertEqual(skip_start_hms(90), (1, 30))
         self.assertEqual(skip_start_hms(46), (0, 46))
+
+    def test_detect_timing_clamps(self) -> None:
+        self.assertEqual(clamp_ad_skip_sec("-1"), 0.0)
+        self.assertEqual(clamp_frame_interval_sec("0.2"), 0.5)
+        self.assertEqual(clamp_frame_interval_sec("12"), 10.0)
+        self.assertEqual(clamp_confirm_frames("0"), 1)
+        self.assertEqual(clamp_confirm_frames("99"), 10)
 
 
 class SimilarityTests(unittest.TestCase):

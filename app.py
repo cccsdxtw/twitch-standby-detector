@@ -674,6 +674,36 @@ def clamp_skip_start_after_min(
     return min(minutes, 24 * 60)
 
 
+def clamp_ad_skip_sec(value: object, default: float = 20.0) -> float:
+    try:
+        seconds = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, seconds)
+
+
+def clamp_frame_interval_sec(value: object, default: float = 3.0) -> float:
+    try:
+        seconds = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return min(max(seconds, 0.5), 10.0)
+
+
+def clamp_confirm_frames(value: object, default: int = 4) -> int:
+    try:
+        frames = int(float(value))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return min(max(frames, 1), 10)
+
+
+def _fmt_setting_number(value: float) -> str:
+    if float(value) == int(value):
+        return str(int(value))
+    return str(value)
+
+
 def skip_start_hms(minutes: int) -> tuple[int, int]:
     minutes = clamp_skip_start_after_min(minutes)
     return minutes // 60, minutes % 60
@@ -754,9 +784,11 @@ def load_settings() -> Settings:
         discord_start_template=os.getenv("DISCORD_START_TEMPLATE") or "",
         simulate=simulate,
         standby_dir=os.path.join(app_dir(), "standby"),
-        frame_interval_sec=max(_env_float("FRAME_INTERVAL_SEC", 3.0), 1.0),
-        ad_skip_sec=max(_env_float("AD_SKIP_SEC", 20.0), 0.0),
-        confirm_frames=max(_env_int("CONFIRM_FRAMES", 4), 1),
+        frame_interval_sec=clamp_frame_interval_sec(
+            os.getenv("FRAME_INTERVAL_SEC", "3")
+        ),
+        ad_skip_sec=clamp_ad_skip_sec(os.getenv("AD_SKIP_SEC", "20")),
+        confirm_frames=clamp_confirm_frames(os.getenv("CONFIRM_FRAMES", "4")),
         hash_threshold=max(_env_int("HASH_THRESHOLD", 16), 1),
         skip_start_after_min=clamp_skip_start_after_min(
             os.getenv("SKIP_START_AFTER_MIN", str(DEFAULT_SKIP_START_AFTER_MIN))
@@ -2679,7 +2711,7 @@ class SettingsWindow(tk.Toplevel):
         super().__init__(app.root)
         self.app = app
         self.title("修改設定")
-        self.geometry("640x560")
+        self.geometry("660x640")
         self.configure(bg=BG)
         self.transient(app.root)
         current = load_settings()
@@ -2751,7 +2783,28 @@ class SettingsWindow(tk.Toplevel):
             time_page,
             "例如 0 小時 46 分，或 1 小時 20 分。剛開台仍會偵測；超過此時長就停抽幀。",
             fg=MUTED,
-        ).pack(anchor="w", pady=(8, 0))
+        ).pack(anchor="w", pady=(4, 12))
+        label(time_page, "開始通知要多快（正片大約是：略過秒數 + 抽幀間隔 × 連續張數）").pack(
+            fill=tk.X, pady=(0, 4)
+        )
+        self.ad_skip = self._field(
+            time_page,
+            "開台後略過秒數（廣告／過場）",
+            _fmt_setting_number(current.ad_skip_sec),
+            "",
+        )
+        self.frame_interval = self._field(
+            time_page,
+            "抽幀間隔秒數（0.5–10）",
+            _fmt_setting_number(current.frame_interval_sec),
+            "",
+        )
+        self.confirm_frames = self._field(
+            time_page,
+            "連續幾張不像待命才通知（1–10）",
+            str(current.confirm_frames),
+            "",
+        )
 
         label(
             talk_page,
@@ -2879,13 +2932,24 @@ class SettingsWindow(tk.Toplevel):
                     "DISCORD_LIVE_TEMPLATE": self.live_template.get("1.0", "end-1c"),
                     "DISCORD_START_TEMPLATE": self.start_template.get("1.0", "end-1c"),
                     "SKIP_START_AFTER_MIN": str(self._skip_start_minutes()),
+                    "AD_SKIP_SEC": str(
+                        clamp_ad_skip_sec(self.ad_skip.get().strip() or "0")
+                    ),
+                    "FRAME_INTERVAL_SEC": str(
+                        clamp_frame_interval_sec(
+                            self.frame_interval.get().strip() or "3"
+                        )
+                    ),
+                    "CONFIRM_FRAMES": str(
+                        clamp_confirm_frames(self.confirm_frames.get().strip() or "4")
+                    ),
                 }
             )
         except OSError as exc:
             self.app.log(f"❌ 設定儲存失敗：{exc}")
             return
         self.app.refresh_settings_status()
-        self.app.log("✅ 設定已儲存。下次按啟動就會用新的 ID / Webhook／開頭偵測時限／發話文案。")
+        self.app.log("✅ 設定已儲存。下次按啟動就會用新的連線、時間與發話設定。")
         self.destroy()
 
 
