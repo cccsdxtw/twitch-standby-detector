@@ -449,6 +449,9 @@ class Settings:
     twitch_client_secret: str
     user_logins: tuple[str, ...]
     discord_webhook_url: str
+    discord_webhook_start_url: str
+    discord_live_template: str
+    discord_start_template: str
     simulate: bool
     standby_dir: str
     frame_interval_sec: float
@@ -588,6 +591,15 @@ def save_channel_prefs(prefs: list[ChannelPref]) -> None:
             handle.write("\n")
 
 
+def encode_env_value(value: str) -> str:
+    """.env 單行寫入；有換行或引號時改成雙引號並轉義。"""
+    text = value.replace("\r\n", "\n").replace("\r", "\n")
+    if re.search(r'[\n"#]', text) or text[:1].isspace() or text[-1:].isspace():
+        escaped = text.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+        return f'"{escaped}"'
+    return text
+
+
 def env_path() -> str:
     return os.path.join(app_dir(), ".env")
 
@@ -609,13 +621,13 @@ def upsert_env_values(values: dict[str, str]) -> None:
             continue
         key = line.split("=", 1)[0].strip()
         if key in values:
-            updated.append(f"{key}={values[key]}")
+            updated.append(f"{key}={encode_env_value(values[key])}")
             seen.add(key)
         else:
             updated.append(line)
     for key, value in values.items():
         if key not in seen:
-            updated.append(f"{key}={value}")
+            updated.append(f"{key}={encode_env_value(value)}")
 
     with open(path, "w", encoding="utf-8", newline="\n") as handle:
         handle.write("\n".join(updated))
@@ -737,6 +749,9 @@ def load_settings() -> Settings:
         twitch_client_secret=os.getenv("TWITCH_CLIENT_SECRET", "").strip(),
         user_logins=logins,
         discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", "").strip(),
+        discord_webhook_start_url=os.getenv("DISCORD_WEBHOOK_START_URL", "").strip(),
+        discord_live_template=os.getenv("DISCORD_LIVE_TEMPLATE") or "",
+        discord_start_template=os.getenv("DISCORD_START_TEMPLATE") or "",
         simulate=simulate,
         standby_dir=os.path.join(app_dir(), "standby"),
         frame_interval_sec=max(_env_float("FRAME_INTERVAL_SEC", 3.0), 1.0),
@@ -765,6 +780,59 @@ def build_webhook_body(content: str) -> dict:
 def twitch_channel_url(login: str) -> str:
     handle = normalize_login(login)
     return f"https://www.twitch.tv/{handle}" if handle else ""
+
+
+DEFAULT_LIVE_TEMPLATE = "「<實況主名稱>」在實況了\n來去 <實況主網址> 看看"
+DEFAULT_START_TEMPLATE = "「<實況主名稱>」正片開始了\n來去 <實況主網址> 看看"
+NOTIFY_TOKEN_RE = re.compile(r"<([^<>]+)>")
+
+
+def webhook_for_notify(kind: str, settings: Settings) -> str:
+    """kind 為 live 或 start。有填輔助網址時，正片走輔助，開台走主網址。"""
+    if kind == "start" and settings.discord_webhook_start_url:
+        return settings.discord_webhook_start_url
+    return settings.discord_webhook_url
+
+
+def render_notify_template(
+    template: str,
+    display_name: str,
+    login: str,
+    *,
+    default: str,
+) -> str:
+    raw = template if (template or "").strip() else default
+    name = (display_name or login).strip() or login
+    handle = (login or "").strip().lower()
+    url = twitch_channel_url(handle)
+
+    def _replace(match: re.Match[str]) -> str:
+        token = re.sub(r"\s+", "", match.group(1))
+        if token == "實況主名稱":
+            return name
+        if token in {"實況主ID", "實況主ＩＤ", "實況主id"}:
+            return handle
+        if token == "實況主網址":
+            return url
+        return match.group(0)
+
+    return NOTIFY_TOKEN_RE.sub(_replace, raw)
+
+
+def build_live_message(
+    display_name: str, login: str, template: str = ""
+) -> str:
+    return render_notify_template(
+        template, display_name, login, default=DEFAULT_LIVE_TEMPLATE
+    )
+
+
+def build_start_message(
+    display_name: str, login: str, template: str = ""
+) -> str:
+    return render_notify_template(
+        template, display_name, login, default=DEFAULT_START_TEMPLATE
+    )
 
 
 WATCH_CDP_PORT = 9333
@@ -924,18 +992,6 @@ class WatchBrowser:
     def _cdp_close(self, target_id: str) -> None:
         with urllib.request.urlopen(cdp_close_tab_url(target_id, self.port), timeout=8):
             pass
-
-
-def build_live_message(display_name: str, login: str) -> str:
-    name = (display_name or login).strip() or login
-    handle = (login or "").strip().lower()
-    return f"「{name}」在實況了\n來去 {twitch_channel_url(handle)} 看看"
-
-
-def build_start_message(display_name: str, login: str) -> str:
-    name = (display_name or login).strip() or login
-    handle = (login or "").strip().lower()
-    return f"「{name}」正片開始了\n來去 https://www.twitch.tv/{handle} 看看"
 
 
 async def send_webhook(
@@ -2248,7 +2304,7 @@ async def _kill_all(procs: list[asyncio.subprocess.Process]) -> None:
 
 # === app ===
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
 ROW_PHASES: dict[str, tuple[str, str]] = {
     "idle": ("未監控", MUTED),
@@ -2623,28 +2679,52 @@ class SettingsWindow(tk.Toplevel):
         super().__init__(app.root)
         self.app = app
         self.title("修改設定")
-        self.geometry("560x460")
+        self.geometry("640x520")
         self.configure(bg=BG)
         self.transient(app.root)
         current = load_settings()
+        self._pages: dict[str, tk.Frame] = {}
+        self._nav_btns: dict[str, tk.Button] = {}
+        self._active_page = ""
+        self._template_focus: tk.Text | None = None
 
-        box = group(self, "連線與通知")
-        box.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
-        label(box, "這些存在本機 .env，不會上傳 Git。改完按儲存套用即可。").pack(
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 0))
+        nav = tk.Frame(body, bg=BG, width=118)
+        nav.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        nav.pack_propagate(False)
+        content = tk.Frame(body, bg=PANEL)
+        content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        call_page = tk.Frame(content, bg=PANEL)
+        time_page = tk.Frame(content, bg=PANEL)
+        talk_page = tk.Frame(content, bg=PANEL)
+        self._pages = {
+            "呼叫設定": call_page,
+            "時間設定": time_page,
+            "發話設定": talk_page,
+        }
+
+        label(call_page, "連 Twitch 用。存在本機 .env，不會上傳 Git。").pack(
             anchor="w", pady=(0, 8)
         )
-
-        self.client_id = self._field(box, "Twitch Client ID", current.twitch_client_id, "")
+        self.client_id = self._field(
+            call_page, "Twitch Client ID", current.twitch_client_id, ""
+        )
         self.client_secret = self._field(
-            box, "Twitch Client Secret（可空）", current.twitch_client_secret, "*"
+            call_page, "Twitch Client Secret（可空）", current.twitch_client_secret, "*"
         )
-        self.webhook = self._field(
-            box, "Discord Webhook 網址", current.discord_webhook_url, ""
+        label(
+            call_page,
+            "Client ID：Twitch 開發者主控台 → 應用程式 → 管理。\n"
+            "Redirect URL 可填 http://localhost。",
+            fg=MUTED,
+        ).pack(anchor="w", pady=(8, 0))
+
+        label(time_page, "開台超過多久就不再偵測開頭（兩個都 0＝不略過）").pack(
+            fill=tk.X, pady=(0, 4)
         )
-        label(box, "開台超過多久就不再偵測開頭（兩個都 0＝不略過）").pack(
-            fill=tk.X, pady=(8, 0)
-        )
-        skip_row = tk.Frame(box, bg=PANEL)
+        skip_row = tk.Frame(time_page, bg=PANEL)
         skip_row.pack(fill=tk.X, pady=(2, 4))
         hours, mins = skip_start_hms(current.skip_start_after_min)
         self.skip_hours = entry(skip_row, None, width=6)
@@ -2656,18 +2736,86 @@ class SettingsWindow(tk.Toplevel):
         self.skip_mins.insert(0, str(mins))
         tk.Label(skip_row, text=" 分鐘", bg=PANEL, fg=FG, font=FONT).pack(side=tk.LEFT)
         label(
-            box,
+            time_page,
             "例如 0 小時 46 分，或 1 小時 20 分。剛開台仍會偵測；超過此時長就停抽幀。",
             fg=MUTED,
-        ).pack(anchor="w", pady=(0, 8))
+        ).pack(anchor="w", pady=(4, 0))
 
         label(
-            box,
-            "Client ID：Twitch 開發者主控台 → 應用程式 → 管理\n"
-            "Webhook：Discord 頻道設定 → 整合 → Webhook → 複製網址",
-        ).pack(anchor="w", pady=(4, 8))
+            talk_page,
+            "主網址必填才會發 Discord。輔助可空：沒填則開台、正片都走主網址；有填則開台走主、正片走輔助。",
+            fg=MUTED,
+        ).pack(anchor="w", pady=(0, 6))
+        self.webhook = self._field(
+            talk_page, "Discord Webhook 網址（主）", current.discord_webhook_url, ""
+        )
+        self.webhook_start = self._field(
+            talk_page,
+            "Discord Webhook 網址（輔助）",
+            current.discord_webhook_start_url,
+            "",
+        )
+        label(
+            talk_page,
+            "文案可直接寫 Discord 提及，例如 <@&角色數字ID>。佔位符會替換成該台資料：",
+            fg=MUTED,
+        ).pack(anchor="w", pady=(8, 2))
+        token_row = tk.Frame(talk_page, bg=PANEL)
+        token_row.pack(fill=tk.X, pady=(0, 6))
+        for token in ("<實況主名稱>", "<實況主ＩＤ>", "<實況主網址>", "<@&>"):
+            small_button(
+                token_row, token, lambda t=token: self._insert_token(t), GRAY
+            ).pack(side=tk.LEFT, padx=(0, 4))
+        self.live_template = self._text_field(
+            talk_page,
+            "開台通知文案",
+            current.discord_live_template.strip() or DEFAULT_LIVE_TEMPLATE,
+        )
+        self.start_template = self._text_field(
+            talk_page,
+            "正片開始文案",
+            current.discord_start_template.strip() or DEFAULT_START_TEMPLATE,
+        )
+        label(
+            talk_page,
+            "Webhook：Discord 頻道設定 → 整合 → Webhook → 複製網址。",
+            fg=MUTED,
+        ).pack(anchor="w", pady=(6, 0))
 
-        color_button(box, "💾  儲存套用", self._save, ORANGE).pack(fill=tk.X, pady=(4, 0))
+        for title in ("呼叫設定", "時間設定", "發話設定"):
+            btn = tk.Button(
+                nav,
+                text=title,
+                command=lambda t=title: self._show_page(t),
+                bg=PANEL,
+                fg=FG,
+                activebackground=NAVY,
+                activeforeground="white",
+                font=FONT_BOLD,
+                relief=tk.FLAT,
+                anchor="w",
+                padx=10,
+                pady=8,
+                cursor="hand2",
+            )
+            btn.pack(fill=tk.X, pady=(0, 6))
+            self._nav_btns[title] = btn
+
+        color_button(self, "💾  儲存套用", self._save, ORANGE).pack(
+            fill=tk.X, padx=10, pady=10
+        )
+        self._show_page("呼叫設定")
+
+    def _show_page(self, title: str) -> None:
+        self._active_page = title
+        for name, page in self._pages.items():
+            page.pack_forget()
+        self._pages[title].pack(fill=tk.BOTH, expand=True)
+        for name, btn in self._nav_btns.items():
+            if name == title:
+                btn.config(bg=NAVY, fg="white")
+            else:
+                btn.config(bg=PANEL, fg=FG)
 
     def _field(self, parent: tk.Widget, title: str, value: str, show: str) -> tk.Entry:
         box = tk.Frame(parent, bg=PANEL)
@@ -2677,6 +2825,37 @@ class SettingsWindow(tk.Toplevel):
         widget.pack(fill=tk.X)
         widget.insert(0, value)
         return widget
+
+    def _text_field(self, parent: tk.Widget, title: str, value: str) -> tk.Text:
+        box = tk.Frame(parent, bg=PANEL)
+        box.pack(fill=tk.BOTH, expand=True, pady=4)
+        label(box, title).pack(fill=tk.X)
+        widget = tk.Text(
+            box,
+            height=4,
+            font=FONT,
+            relief=tk.SOLID,
+            bd=1,
+            wrap=tk.WORD,
+        )
+        widget.pack(fill=tk.BOTH, expand=True)
+        widget.insert("1.0", value)
+        widget.bind("<FocusIn>", lambda _e, w=widget: self._set_template_focus(w))
+        return widget
+
+    def _set_template_focus(self, widget: tk.Text) -> None:
+        self._template_focus = widget
+
+    def _insert_token(self, token: str) -> None:
+        target = self._template_focus
+        if target is None:
+            target = self.live_template
+        try:
+            target.insert(tk.INSERT, token)
+            target.focus_set()
+            self._template_focus = target
+        except tk.TclError:
+            pass
 
     def _skip_start_minutes(self) -> int:
         try:
@@ -2698,6 +2877,9 @@ class SettingsWindow(tk.Toplevel):
                     "TWITCH_CLIENT_ID": self.client_id.get().strip(),
                     "TWITCH_CLIENT_SECRET": self.client_secret.get().strip(),
                     "DISCORD_WEBHOOK_URL": self.webhook.get().strip(),
+                    "DISCORD_WEBHOOK_START_URL": self.webhook_start.get().strip(),
+                    "DISCORD_LIVE_TEMPLATE": self.live_template.get("1.0", "end-1c"),
+                    "DISCORD_START_TEMPLATE": self.start_template.get("1.0", "end-1c"),
                     "SKIP_START_AFTER_MIN": str(self._skip_start_minutes()),
                 }
             )
@@ -2705,7 +2887,7 @@ class SettingsWindow(tk.Toplevel):
             self.app.log(f"❌ 設定儲存失敗：{exc}")
             return
         self.app.refresh_settings_status()
-        self.app.log("✅ 設定已儲存。下次按啟動就會用新的 ID / Webhook／開頭偵測時限。")
+        self.app.log("✅ 設定已儲存。下次按啟動就會用新的 ID / Webhook／開頭偵測時限／發話文案。")
         self.destroy()
 
 
@@ -2815,7 +2997,9 @@ class StreamMonitorApp:
     def refresh_settings_status(self) -> None:
         settings = load_settings()
         client = "已填" if settings.twitch_client_id else "未填"
-        hook = "已填" if settings.discord_webhook_url else "未填"
+        hook = "雙網址" if settings.discord_webhook_start_url else (
+            "已填" if settings.discord_webhook_url else "未填"
+        )
         skip = skip_start_after_label(settings.skip_start_after_min)
         self.settings_status.config(
             text=f"Client ID：{client}　Discord：{hook}　開頭偵測：{skip}"
@@ -3339,8 +3523,10 @@ class StreamMonitorApp:
             self.log(f"🚨 {source}：{name} ({login}) 開台了！")
             if pref.notify_live:
                 await send_webhook(
-                    settings.discord_webhook_url,
-                    build_live_message(name, login),
+                    webhook_for_notify("live", settings),
+                    build_live_message(
+                        name, login, settings.discord_live_template
+                    ),
                     client=http,
                     log=self.log,
                 )
@@ -3461,8 +3647,10 @@ class StreamMonitorApp:
                     if pref.notify_start:
                         display = self._display_names.get(login, login)
                         await send_webhook(
-                            settings.discord_webhook_url,
-                            build_start_message(display, login),
+                            webhook_for_notify("start", settings),
+                            build_start_message(
+                                display, login, settings.discord_start_template
+                            ),
                             client=http,
                             log=self.log,
                         )

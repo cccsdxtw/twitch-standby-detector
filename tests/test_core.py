@@ -16,6 +16,7 @@ from app import (
     TokenPair,
     app_dir,
     avatar_cache_path,
+    Settings,
     build_live_message,
     build_start_message,
     build_webhook_body,
@@ -48,6 +49,9 @@ from app import (
     write_avatar_bytes,
     row_phase_style,
     ROW_PHASES,
+    encode_env_value,
+    render_notify_template,
+    webhook_for_notify,
     window_close_hides_to_tray,
 )
 
@@ -80,6 +84,7 @@ class EnvUpsertTests(unittest.TestCase):
                     {
                         "TWITCH_CLIENT_ID": "newid",
                         "DISCORD_WEBHOOK_URL": "https://example.com/hook",
+                        "DISCORD_LIVE_TEMPLATE": "開台 <實況主名稱>\n第二行",
                     }
                 )
             with open(path, encoding="utf-8") as handle:
@@ -88,6 +93,7 @@ class EnvUpsertTests(unittest.TestCase):
         self.assertIn("TWITCH_CLIENT_ID=newid", text)
         self.assertIn("SIMULATE=0", text)
         self.assertIn("DISCORD_WEBHOOK_URL=https://example.com/hook", text)
+        self.assertIn('DISCORD_LIVE_TEMPLATE="開台 <實況主名稱>\\n第二行"', text)
 
 
 class PathsTests(unittest.TestCase):
@@ -171,6 +177,74 @@ class DiscordTests(unittest.TestCase):
             build_start_message("貓辣妹", "maoramei"),
             "「貓辣妹」正片開始了\n來去 https://www.twitch.tv/maoramei 看看",
         )
+
+    def test_custom_template_keeps_role_mention(self) -> None:
+        text = render_notify_template(
+            "<@&123456> <實況主名稱> (<實況主ＩＤ>) <實況主網址>",
+            "貓辣妹",
+            "MaoRamei",
+            default="x",
+        )
+        self.assertEqual(
+            text,
+            "<@&123456> 貓辣妹 (maoramei) https://www.twitch.tv/maoramei",
+        )
+
+    def test_spaces_inside_placeholder(self) -> None:
+        text = render_notify_template(
+            "< 實況主名稱 >",
+            "藍莓",
+            "lanmei",
+            default="x",
+        )
+        self.assertEqual(text, "藍莓")
+
+    def test_aux_webhook_only_for_start(self) -> None:
+        settings = Settings(
+            twitch_client_id="",
+            twitch_client_secret="",
+            user_logins=(),
+            discord_webhook_url="https://discord.example/main",
+            discord_webhook_start_url="https://discord.example/start",
+            discord_live_template="",
+            discord_start_template="",
+            simulate=True,
+            standby_dir=".",
+            frame_interval_sec=3,
+            ad_skip_sec=20,
+            confirm_frames=4,
+            hash_threshold=16,
+            skip_start_after_min=60,
+        )
+        self.assertEqual(
+            webhook_for_notify("live", settings), "https://discord.example/main"
+        )
+        self.assertEqual(
+            webhook_for_notify("start", settings), "https://discord.example/start"
+        )
+        empty_aux = Settings(
+            twitch_client_id="",
+            twitch_client_secret="",
+            user_logins=(),
+            discord_webhook_url="https://discord.example/main",
+            discord_webhook_start_url="",
+            discord_live_template="",
+            discord_start_template="",
+            simulate=True,
+            standby_dir=".",
+            frame_interval_sec=3,
+            ad_skip_sec=20,
+            confirm_frames=4,
+            hash_threshold=16,
+            skip_start_after_min=60,
+        )
+        self.assertEqual(
+            webhook_for_notify("start", empty_aux), "https://discord.example/main"
+        )
+
+    def test_encode_env_multiline(self) -> None:
+        self.assertEqual(encode_env_value("plain"), "plain")
+        self.assertEqual(encode_env_value("a\nb"), '"a\\nb"')
 
 
 class WatchlistPrefTests(unittest.TestCase):
