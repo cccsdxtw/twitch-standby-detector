@@ -273,6 +273,7 @@ class WatchlistPrefTests(unittest.TestCase):
                             similarity_pct=70,
                             ignore_color="#ffffff",
                             ignore_tolerance=35,
+                            ref_origin="user",
                         ),
                         ChannelPref("lanmeinotbeer", notify_live=False, notify_start=True),
                     ]
@@ -293,7 +294,9 @@ class WatchlistPrefTests(unittest.TestCase):
         self.assertEqual(prefs[0].similarity_pct, 70)
         self.assertEqual(prefs[0].ignore_color, "#ffffff")
         self.assertEqual(prefs[0].ignore_tolerance, 35)
+        self.assertEqual(prefs[0].ref_origin, "user")
         self.assertEqual(prefs[1].similarity_pct, 60)
+        self.assertEqual(prefs[1].ref_origin, "")
 
     def test_open_watch_defaults_off(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

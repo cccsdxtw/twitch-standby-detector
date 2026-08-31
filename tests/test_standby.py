@@ -118,6 +118,86 @@ class IgnoreColorTests(unittest.TestCase):
         self.assertLessEqual(masked, 6)
 
 
+class PendingCandidateTests(unittest.TestCase):
+    def test_pending_not_used_as_official_refs(self) -> None:
+        from app import (
+            describe_references,
+            list_pending_files,
+            promote_pending_files,
+            save_pending_frame,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            img = _scene("standby")
+            save_pending_frame(tmp, "lanmei", img, 1)
+            save_pending_frame(tmp, "lanmei", img, 2)
+            self.assertEqual(len(list_pending_files(tmp, "lanmei")), 2)
+            self.assertEqual(list_reference_files(tmp, "lanmei"), [])
+            self.assertIn("2 張開台候選", describe_references(tmp, "lanmei"))
+            promoted = promote_pending_files(tmp, "lanmei")
+            self.assertEqual(len(promoted), 2)
+            self.assertEqual(len(list_reference_files(tmp, "lanmei")), 2)
+            self.assertEqual(list_pending_files(tmp, "lanmei"), [])
+            self.assertEqual(describe_references(tmp, "lanmei"), "2 張待命樣本")
+
+
+class StillStandbyTests(unittest.TestCase):
+    def test_user_origin_appends_and_keeps_pending(self) -> None:
+        from app import (
+            REF_ORIGIN_USER,
+            confirm_still_standby,
+            import_standby_image,
+            list_pending_files,
+            save_pending_frame,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            user = _scene("standby")
+            src = os.path.join(tmp, "src.png")
+            user.save(src)
+            import_standby_image(tmp, "lanmei", src)
+            save_pending_frame(tmp, "lanmei", _scene("standby"), 1)
+            extra = _scene("main")
+            kind, origin, files = confirm_still_standby(
+                tmp, "lanmei", REF_ORIGIN_USER, extra
+            )
+            self.assertEqual(kind, "append_user")
+            self.assertEqual(origin, REF_ORIGIN_USER)
+            self.assertEqual(len(files), 2)
+            self.assertEqual(len(list_pending_files(tmp, "lanmei")), 1)
+
+    def test_auto_origin_adopts_pending_then_appends(self) -> None:
+        from app import REF_ORIGIN_AUTO, confirm_still_standby, save_pending_frame
+
+        with tempfile.TemporaryDirectory() as tmp:
+            save_pending_frame(tmp, "lanmei", _scene("standby"), 1)
+            save_pending_frame(tmp, "lanmei", _scene("standby"), 2)
+            kind, origin, files = confirm_still_standby(
+                tmp, "lanmei", "", _scene("main")
+            )
+            self.assertEqual(kind, "adopt_auto")
+            self.assertEqual(origin, REF_ORIGIN_AUTO)
+            self.assertEqual(len(files), 3)
+
+    def test_auto_origin_appends_without_wiping(self) -> None:
+        from app import (
+            REF_ORIGIN_AUTO,
+            confirm_still_standby,
+            promote_pending_files,
+            save_pending_frame,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            save_pending_frame(tmp, "lanmei", _scene("standby"), 1)
+            promote_pending_files(tmp, "lanmei")
+            kind, origin, files = confirm_still_standby(
+                tmp, "lanmei", REF_ORIGIN_AUTO, _scene("main")
+            )
+            self.assertEqual(kind, "append_auto")
+            self.assertEqual(origin, REF_ORIGIN_AUTO)
+            self.assertEqual(len(files), 2)
+
+
 class PickStreamTests(unittest.TestCase):
     def test_parse_height(self) -> None:
         self.assertEqual(parse_height("480p60"), 480)

@@ -147,17 +147,18 @@ def small_button(parent: tk.Widget, text: str, command, bg: str) -> tk.Button:
 
 
 AVATAR_SIZE = 24
+LIST_VIEW_HEIGHT = 168
 _HSCROLL_SKIP = (tk.Entry, tk.Spinbox, tk.Button, tk.Checkbutton)
 
 
 def bind_hscroll_drag(canvas: tk.Canvas, widget: tk.Widget) -> None:
-    """讓頻道列可用滑鼠左右拖動，略過輸入框與按鈕以免搶操作。"""
+    """頻道列空白處可上下左右拖動捲動，略過輸入框與按鈕以免搶操作。"""
 
     def _start(event: tk.Event) -> None:
-        canvas.scan_mark(event.x_root, 0)
+        canvas.scan_mark(event.x_root, event.y_root)
 
     def _move(event: tk.Event) -> str | None:
-        canvas.scan_dragto(event.x_root, 0, gain=1)
+        canvas.scan_dragto(event.x_root, event.y_root, gain=1)
         return "break"
 
     def _walk(node: tk.Widget) -> None:
@@ -171,30 +172,64 @@ def bind_hscroll_drag(canvas: tk.Canvas, widget: tk.Widget) -> None:
     _walk(widget)
 
 
+def bind_list_wheel(canvas: tk.Canvas, widget: tk.Widget) -> None:
+    def _wheel(event: tk.Event) -> str | None:
+        steps = int(-event.delta / 120) if event.delta else 0
+        if steps:
+            canvas.yview_scroll(steps, "units")
+        return "break"
+
+    def _linux_up(_event: tk.Event) -> str | None:
+        canvas.yview_scroll(-1, "units")
+        return "break"
+
+    def _linux_down(_event: tk.Event) -> str | None:
+        canvas.yview_scroll(1, "units")
+        return "break"
+
+    def _walk(node: tk.Widget) -> None:
+        node.bind("<MouseWheel>", _wheel, add="+")
+        node.bind("<Button-4>", _linux_up, add="+")
+        node.bind("<Button-5>", _linux_down, add="+")
+        for child in node.winfo_children():
+            _walk(child)
+
+    _walk(widget)
+
+
 def attach_hscroll(parent: tk.Widget) -> tuple[tk.Canvas, tk.Frame]:
-    """回傳 (canvas, inner)。inner 用來放頻道列，超出寬度可左右拖。"""
+    """回傳 (canvas, inner)。inner 放頻道列：太高可上下拖／捲，太寬可左右拖。"""
     wrap = tk.Frame(parent, bg=PANEL)
-    wrap.pack(fill=tk.X)
-    canvas = tk.Canvas(wrap, bg=PANEL, highlightthickness=0, bd=0, height=40)
-    bar = tk.Scrollbar(wrap, orient=tk.HORIZONTAL, command=canvas.xview)
-    canvas.configure(xscrollcommand=bar.set)
-    canvas.pack(fill=tk.X)
-    bar.pack(fill=tk.X)
+    wrap.pack(fill=tk.BOTH, expand=True)
+    canvas = tk.Canvas(
+        wrap, bg=PANEL, highlightthickness=0, bd=0, height=LIST_VIEW_HEIGHT
+    )
+    vbar = tk.Scrollbar(wrap, orient=tk.VERTICAL, command=canvas.yview)
+    hbar = tk.Scrollbar(wrap, orient=tk.HORIZONTAL, command=canvas.xview)
+    canvas.configure(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
+    canvas.grid(row=0, column=0, sticky="nsew")
+    vbar.grid(row=0, column=1, sticky="ns")
+    hbar.grid(row=1, column=0, sticky="ew")
+    wrap.grid_rowconfigure(0, weight=1)
+    wrap.grid_columnconfigure(0, weight=1)
     inner = tk.Frame(canvas, bg=PANEL)
     window = canvas.create_window((0, 0), window=inner, anchor="nw")
 
     def _sync(_event: tk.Event | None = None) -> None:
         inner.update_idletasks()
-        bbox = canvas.bbox("all")
-        if not bbox:
-            return
-        canvas.configure(scrollregion=bbox)
-        canvas.configure(height=max(40, bbox[3] - bbox[1]))
-        canvas.itemconfigure(window, height=bbox[3] - bbox[1])
+        req_w = max(inner.winfo_reqwidth(), 1)
+        req_h = max(inner.winfo_reqheight(), 1)
+        view_w = max(canvas.winfo_width(), 1)
+        canvas.itemconfigure(window, width=max(req_w, view_w))
+        canvas.configure(scrollregion=(0, 0, max(req_w, view_w), req_h))
 
     inner.bind("<Configure>", _sync)
+    canvas.bind("<Configure>", _sync)
+    canvas._resync = _sync  # type: ignore[attr-defined]
     bind_hscroll_drag(canvas, canvas)
     bind_hscroll_drag(canvas, inner)
+    bind_list_wheel(canvas, canvas)
+    bind_list_wheel(canvas, inner)
     return canvas, inner
 
 
@@ -479,6 +514,7 @@ class ChannelPref:
     similarity_pct: int = DEFAULT_SIMILARITY_PCT
     ignore_color: str = ""
     ignore_tolerance: int = DEFAULT_IGNORE_TOLERANCE
+    ref_origin: str = ""
 
 
 def watchlist_path() -> str:
@@ -557,6 +593,7 @@ def load_channel_prefs() -> list[ChannelPref]:
                         ignore_tolerance=clamp_ignore_tolerance(
                             item.get("ignore_tolerance", DEFAULT_IGNORE_TOLERANCE)
                         ),
+                        ref_origin=normalize_ref_origin(item.get("ref_origin", "")),
                     )
                 )
         if prefs:
@@ -578,6 +615,7 @@ def save_channel_prefs(prefs: list[ChannelPref]) -> None:
             "similarity_pct": clamp_similarity_pct(pref.similarity_pct),
             "ignore_color": pref.ignore_color,
             "ignore_tolerance": clamp_ignore_tolerance(pref.ignore_tolerance),
+            "ref_origin": normalize_ref_origin(pref.ref_origin),
         }
         for pref in prefs
         if pref.login
@@ -1113,6 +1151,182 @@ from PIL import Image, UnidentifiedImageError
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
+CANDIDATE_FRAMES = 5
+REF_ORIGIN_USER = "user"
+REF_ORIGIN_AUTO = "auto"
+
+
+def pending_dir(standby_dir: str) -> str:
+    return os.path.join(standby_dir, "pending")
+
+
+def last_frame_dir(standby_dir: str) -> str:
+    return os.path.join(standby_dir, "last")
+
+
+def last_frame_path(standby_dir: str, login: str) -> str:
+    return os.path.join(last_frame_dir(standby_dir), f"{login.lower()}.png")
+
+
+def save_last_frame(standby_dir: str, login: str, image: Image.Image) -> str:
+    os.makedirs(last_frame_dir(standby_dir), exist_ok=True)
+    dest = last_frame_path(standby_dir, login)
+    image.convert("RGB").save(dest, "PNG")
+    return dest
+
+
+def load_last_frame(standby_dir: str, login: str) -> Image.Image | None:
+    path = last_frame_path(standby_dir, login)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with Image.open(path) as img:
+            img.load()
+            return img.convert("RGB")
+    except (OSError, UnidentifiedImageError):
+        return None
+
+
+def normalize_ref_origin(value: object) -> str:
+    text = str(value or "").strip().lower()
+    if text in {REF_ORIGIN_USER, REF_ORIGIN_AUTO}:
+        return text
+    return ""
+
+
+def list_pending_files(standby_dir: str, login: str) -> list[str]:
+    folder = pending_dir(standby_dir)
+    if not os.path.isdir(folder):
+        return []
+    login = login.lower()
+    found: list[str] = []
+    for name in sorted(os.listdir(folder)):
+        stem, ext = os.path.splitext(name)
+        if ext.lower() not in IMAGE_EXTS:
+            continue
+        stem_l = stem.lower()
+        if stem_l == login or stem_l.startswith(f"{login}-") or stem_l.startswith(f"{login}_"):
+            found.append(os.path.join(folder, name))
+    return found
+
+
+def clear_pending_files(standby_dir: str, login: str) -> None:
+    os.makedirs(pending_dir(standby_dir), exist_ok=True)
+    for path in list_pending_files(standby_dir, login):
+        try:
+            os.remove(path)
+        except OSError:
+            continue
+
+
+def save_pending_frame(standby_dir: str, login: str, image: Image.Image, index: int) -> str:
+    login = login.lower()
+    folder = pending_dir(standby_dir)
+    os.makedirs(folder, exist_ok=True)
+    dest = os.path.join(folder, f"{login}-{index:02d}.png")
+    image.convert("RGB").save(dest, "PNG")
+    return dest
+
+
+def next_reference_index(standby_dir: str, login: str) -> int:
+    login = login.lower()
+    highest = 0
+    for path in list_reference_files(standby_dir, login):
+        stem = os.path.splitext(os.path.basename(path))[0].lower()
+        if stem == login:
+            highest = max(highest, 1)
+            continue
+        rest = ""
+        if stem.startswith(f"{login}-"):
+            rest = stem[len(login) + 1 :]
+        elif stem.startswith(f"{login}_"):
+            rest = stem[len(login) + 1 :]
+        if rest.isdigit():
+            highest = max(highest, int(rest))
+    return highest + 1
+
+
+def append_reference_frame(standby_dir: str, login: str, image: Image.Image) -> str:
+    login = login.lower()
+    os.makedirs(standby_dir, exist_ok=True)
+    dest = os.path.join(standby_dir, f"{login}-{next_reference_index(standby_dir, login):02d}.png")
+    image.convert("RGB").save(dest, "PNG")
+    return dest
+
+
+def merge_pending_into_references(standby_dir: str, login: str) -> list[str]:
+    login = login.lower()
+    pending = list_pending_files(standby_dir, login)
+    if not pending:
+        return []
+    os.makedirs(standby_dir, exist_ok=True)
+    saved: list[str] = []
+    for source in pending:
+        dest = os.path.join(
+            standby_dir, f"{login}-{next_reference_index(standby_dir, login):02d}.png"
+        )
+        with Image.open(source) as img:
+            img.load()
+            img.convert("RGB").save(dest, "PNG")
+        saved.append(dest)
+    clear_pending_files(standby_dir, login)
+    return saved
+
+
+def confirm_still_standby(
+    standby_dir: str,
+    login: str,
+    origin: str,
+    image: Image.Image | None,
+) -> tuple[str, str, list[str]]:
+    """誤報補正。回傳 (動作, 新來源, 正式參考檔)。
+
+    你指定的圖／影片：只加當下畫面，不套用開台候選。
+    開台候選：有還沒套用的候選就先併進去，再補當下那張。
+    """
+    login = login.lower()
+    origin = normalize_ref_origin(origin)
+    pending = list_pending_files(standby_dir, login)
+    refs = list_reference_files(standby_dir, login)
+    treat_as_user = origin == REF_ORIGIN_USER or (origin != REF_ORIGIN_AUTO and bool(refs))
+
+    if treat_as_user:
+        if image is None:
+            raise RuntimeError("現在沒有抽到的畫面。請等開台偵測抽幀後再按。")
+        append_reference_frame(standby_dir, login, image)
+        return "append_user", REF_ORIGIN_USER, list_reference_files(standby_dir, login)
+
+    adopted = False
+    if pending:
+        if refs:
+            merge_pending_into_references(standby_dir, login)
+        else:
+            promote_pending_files(standby_dir, login)
+        adopted = True
+    if image is not None:
+        append_reference_frame(standby_dir, login, image)
+    elif not adopted:
+        raise RuntimeError("現在沒有抽到的畫面，也還沒有開台候選。")
+    kind = "adopt_auto" if adopted else "append_auto"
+    return kind, REF_ORIGIN_AUTO, list_reference_files(standby_dir, login)
+
+
+def promote_pending_files(standby_dir: str, login: str) -> list[str]:
+    login = login.lower()
+    pending = list_pending_files(standby_dir, login)
+    if not pending:
+        raise RuntimeError("還沒有開台候選畫面")
+    os.makedirs(standby_dir, exist_ok=True)
+    clear_reference_files(standby_dir, login)
+    saved: list[str] = []
+    for index, source in enumerate(pending, start=1):
+        dest = os.path.join(standby_dir, f"{login}-{index:02d}.png")
+        with Image.open(source) as img:
+            img.load()
+            img.convert("RGB").save(dest, "PNG")
+        saved.append(dest)
+    clear_pending_files(standby_dir, login)
+    return saved
 
 
 def list_reference_files(standby_dir: str, login: str) -> list[str]:
@@ -1121,12 +1335,15 @@ def list_reference_files(standby_dir: str, login: str) -> list[str]:
     login = login.lower()
     found: list[str] = []
     for name in sorted(os.listdir(standby_dir)):
+        path = os.path.join(standby_dir, name)
+        if not os.path.isfile(path):
+            continue
         stem, ext = os.path.splitext(name)
         if ext.lower() not in IMAGE_EXTS:
             continue
         stem_l = stem.lower()
         if stem_l == login or stem_l.startswith(f"{login}-") or stem_l.startswith(f"{login}_"):
-            found.append(os.path.join(standby_dir, name))
+            found.append(path)
     return found
 
 
@@ -1164,13 +1381,21 @@ def clear_reference_files(standby_dir: str, login: str) -> None:
             continue
 
 
-def describe_references(standby_dir: str, login: str) -> str:
+def describe_references(standby_dir: str, login: str, origin: str = "") -> str:
     files = list_reference_files(standby_dir, login)
-    if not files:
-        return "尚未指定待命畫面"
-    if len(files) == 1:
-        return os.path.basename(files[0])
-    return f"{len(files)} 張待命樣本"
+    pending = list_pending_files(standby_dir, login)
+    origin = normalize_ref_origin(origin)
+    if files:
+        base = os.path.basename(files[0]) if len(files) == 1 else f"{len(files)} 張待命樣本"
+        if origin == REF_ORIGIN_AUTO:
+            base = f"{base}（開台候選）"
+        elif origin == REF_ORIGIN_USER:
+            base = f"{base}（你指定）"
+    else:
+        base = "尚未指定待命畫面"
+    if pending:
+        return f"{base}／{len(pending)} 張開台候選"
+    return base
 
 
 def import_standby_image(standby_dir: str, login: str, source: str) -> list[str]:
@@ -2002,6 +2227,8 @@ async def monitor_broadcast(
     pref: ChannelPref | None = None,
     started_at: datetime | None = None,
     on_phase: Callable[[str], None] | None = None,
+    on_candidates: Callable[[], None] | None = None,
+    still_event: asyncio.Event | None = None,
 ) -> bool:
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
@@ -2035,6 +2262,11 @@ async def monitor_broadcast(
         )
     if used:
         log(f"🖼️ [{broadcaster}] 待命參考圖：{', '.join(os.path.basename(p) for p in used)}")
+        if not already_live:
+            log(
+                f"ℹ️ [{broadcaster}] 開台後會另存 {CANDIDATE_FRAMES} 張候選（待機動畫用），"
+                "確認是待機可按「用候選」整組替換。"
+            )
     elif already_live:
         log(
             f"ℹ️ [{broadcaster}] 啟動時已在直播且沒有 standby/{broadcaster}.png，"
@@ -2045,8 +2277,8 @@ async def monitor_broadcast(
         return False
     else:
         log(
-            f"ℹ️ [{broadcaster}] 沒有待命參考圖，將在略過廣告後嘗試建立穩定 baseline。"
-            f"建議放一張截圖到 standby/{broadcaster}.png"
+            f"ℹ️ [{broadcaster}] 沒有待命參考圖，開台後會連存 {CANDIDATE_FRAMES} 張候選。"
+            "確認是待機再按「用候選」。"
         )
 
     tmp = tempfile.mkdtemp(prefix=f"standby-{broadcaster}-")
@@ -2076,6 +2308,9 @@ async def monitor_broadcast(
             ignore_tolerance=ignore_tolerance,
             started_at=started_at,
             on_phase=on_phase,
+            already_live=already_live,
+            on_candidates=on_candidates,
+            still_event=still_event,
         )
     except asyncio.CancelledError:
         raise
@@ -2245,18 +2480,41 @@ async def _watch_frames(
     ignore_tolerance: int,
     started_at: datetime | None = None,
     on_phase: Callable[[str], None] | None = None,
+    already_live: bool = False,
+    on_candidates: Callable[[], None] | None = None,
+    still_event: asyncio.Event | None = None,
 ) -> bool:
     detector = StandbyDetector(refs, threshold, settings.confirm_frames)
+
+    def _reload_from_still() -> bool:
+        if still_event is None or not still_event.is_set():
+            return False
+        still_event.clear()
+        hashes, used = load_reference_hashes(
+            settings.standby_dir,
+            login,
+            ignore_color=ignore_color,
+            ignore_tolerance=ignore_tolerance,
+        )
+        detector.set_references(hashes)
+        log(
+            f"🛠️ [{login}] 已改用 {len(used)} 張待命樣本，當作還在待機，繼續偵測"
+        )
+        if on_phase:
+            on_phase("detecting")
+        return True
     started = time.monotonic()
     last_sig: tuple[float, int] | None = None
-    recent: list[int] = []
     ad_logged = False
-    stable_logged = False
     standby_logs = 0
+    pending_count = 0
+    pending_ready = False
     stderr_tasks = [asyncio.create_task(_collect_stderr(proc)) for proc in procs]
 
     try:
         while not stop_event.is_set():
+            if _reload_from_still():
+                continue
             dead = [proc for proc in procs if proc.returncode is not None]
             if dead:
                 extras = []
@@ -2298,8 +2556,9 @@ async def _watch_frames(
             try:
                 with Image.open(frame_path) as img:
                     img.load()
+                    rgb = img.convert("RGB")
                     frame_hash = dhash_int(
-                        img,
+                        rgb,
                         ignore_color=ignore_color,
                         ignore_tolerance=ignore_tolerance,
                     )
@@ -2313,19 +2572,31 @@ async def _watch_frames(
                     ad_logged = True
                 continue
 
-            if not detector.references:
-                recent.append(frame_hash)
-                recent = recent[-5:]
-                if hashes_are_stable(recent, threshold):
-                    detector.set_references(recent[-3:])
-                    log(f"📌 [{login}] 已建立穩定待命 baseline")
-                    stable_logged = True
-                elif elapsed > 90 and not stable_logged:
+            save_last_frame(settings.standby_dir, login, rgb)
+
+            if not already_live and pending_count < CANDIDATE_FRAMES:
+                if pending_count == 0:
+                    clear_pending_files(settings.standby_dir, login)
+                pending_count += 1
+                save_pending_frame(settings.standby_dir, login, rgb, pending_count)
+                if pending_count >= CANDIDATE_FRAMES and not pending_ready:
+                    pending_ready = True
                     log(
-                        f"⚠️ [{login}] 畫面遲遲不穩定，可能已在正片或待命是動態影片。"
-                        f"請改放 standby/{login}.png"
+                        f"📸 [{login}] 已連存 {CANDIDATE_FRAMES} 張開台候選（待機動畫用）。"
+                        "確認是待機再按「用候選」。"
                     )
-                    stable_logged = True
+                    if on_candidates:
+                        on_candidates()
+
+            if not detector.references:
+                if pending_ready:
+                    log(
+                        f"ℹ️ [{login}] 沒有正式待命圖，略過正片判定。"
+                        "可用「用候選」把剛截的一組設成待命。"
+                    )
+                    if on_phase:
+                        on_phase("live")
+                    return False
                 continue
 
             state, dist = detector.observe(frame_hash)
@@ -2346,6 +2617,8 @@ async def _watch_frames(
                 log(
                     f"🚨🚨 [{login}] 畫面已離開待命（相似度 {sim}%／門檻 {similarity_pct}%），正片開始！"
                 )
+                if _reload_from_still():
+                    continue
                 return True
         return False
     finally:
@@ -2389,7 +2662,7 @@ async def _kill_all(procs: list[asyncio.subprocess.Process]) -> None:
 
 # === app ===
 
-__version__ = "0.16.0"
+__version__ = "0.17.0"
 
 ROW_PHASES: dict[str, tuple[str, str]] = {
     "idle": ("未監控", MUTED),
@@ -2423,6 +2696,7 @@ class ChannelRow:
     ) -> None:
         self.app = app
         self.standby_dir = standby_dir
+        self.ref_origin = normalize_ref_origin(pref.ref_origin)
         self.frame = tk.Frame(master, bg=PANEL)
         self.frame.pack(fill=tk.X, pady=4)
 
@@ -2517,6 +2791,10 @@ class ChannelRow:
         self.img_btn.pack(side=tk.LEFT, padx=2)
         self.vid_btn = small_button(tools, "選影片", self._pick_video, PURPLE)
         self.vid_btn.pack(side=tk.LEFT, padx=2)
+        self.use_cand_btn = small_button(tools, "用候選", self._use_pending, GREEN)
+        self.use_cand_btn.pack(side=tk.LEFT, padx=2)
+        self.still_btn = small_button(tools, "還是待命", self._still_standby, ORANGE)
+        self.still_btn.pack(side=tk.LEFT, padx=2)
 
         tk.Label(tools, text="像", bg=PANEL, fg=MUTED, font=FONT).pack(side=tk.LEFT)
         self.similarity_var = tk.StringVar(value=str(pref.similarity_pct))
@@ -2594,6 +2872,7 @@ class ChannelRow:
             similarity_pct=clamp_similarity_pct(self.similarity_var.get()),
             ignore_color=self.ignore_color,
             ignore_tolerance=clamp_ignore_tolerance(self.ignore_tol_var.get()),
+            ref_origin=normalize_ref_origin(self.ref_origin),
         )
 
     def _saved_display_name(self) -> str:
@@ -2661,7 +2940,7 @@ class ChannelRow:
         if not name:
             self.status.config(text="先填頻道名稱")
             return
-        self.status.config(text=describe_references(self.standby_dir, name))
+        self.status.config(text=describe_references(self.standby_dir, name, self.ref_origin))
 
     def set_enabled(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED
@@ -2673,10 +2952,12 @@ class ChannelRow:
             self.ignore_tol_spin,
             self.img_btn,
             self.vid_btn,
+            self.use_cand_btn,
             self.clear_btn,
             self.remove_btn,
         ):
             widget.config(state=state)
+        self.still_btn.config(state=tk.NORMAL)
 
     def _refresh_swatch(self) -> None:
         color = parse_ignore_color(self.ignore_color)
@@ -2719,6 +3000,7 @@ class ChannelRow:
         except Exception as exc:
             self.app.log(f"❌ [{name}] 匯入圖片失敗：{exc}")
             return
+        self.ref_origin = REF_ORIGIN_USER
         self.refresh_status()
         self.app.log(f"🖼️ [{name}] 已設定待命圖片：{os.path.basename(files[0])}")
         self.app._persist_watchlist()
@@ -2743,16 +3025,40 @@ class ChannelRow:
         except Exception as exc:
             self.app.log(f"❌ [{name}] 匯入影片失敗：{exc}")
             return
+        self.ref_origin = REF_ORIGIN_USER
         self.refresh_status()
         self.app.log(f"🖼️ [{name}] 已從影片抽出 {len(files)} 張待命樣本")
         self.app._persist_watchlist()
+
+    def _use_pending(self) -> None:
+        name = self.login()
+        if not name:
+            self.app.log("❌ 請先填這列的頻道登入名稱，再套用開台候選")
+            return
+        try:
+            files = promote_pending_files(self.standby_dir, name)
+        except Exception as exc:
+            self.app.log(f"❌ [{name}] {exc}")
+            return
+        self.ref_origin = REF_ORIGIN_AUTO
+        self.refresh_status()
+        self.app.log(
+            f"🖼️ [{name}] 已把 {len(files)} 張開台候選設成待命樣本（下次開台起比對這組）"
+        )
+        self.app._persist_watchlist()
+
+    def _still_standby(self) -> None:
+        self.app.apply_still_standby(self)
 
     def _clear_media(self) -> None:
         name = self.login()
         if not name:
             return
         clear_reference_files(self.standby_dir, name)
+        clear_pending_files(self.standby_dir, name)
+        self.ref_origin = ""
         self.refresh_status()
+        self.app._persist_watchlist()
         self.app.log(f"🧹 [{name}] 已清除待命素材")
 
     def _remove(self) -> None:
@@ -3093,6 +3399,7 @@ class StreamMonitorApp:
         self.root = root
         self.root.title(f"實況守門員 主控台 V{__version__}")
         self.root.geometry("1180x720")
+        self.root.minsize(900, 640)
         apply_root(root)
         self._apply_icon()
 
@@ -3102,6 +3409,9 @@ class StreamMonitorApp:
         self._stop_requested = False
         self._bg_done = threading.Event()
         self._monitor_tasks: dict[str, asyncio.Task] = {}
+        self._still_flags: dict[str, asyncio.Event] = {}
+        self._started_at: dict[str, datetime | None] = {}
+        self._http: httpx.AsyncClient | None = None
         self._active_logins: tuple[str, ...] = ()
         self._active_prefs: dict[str, ChannelPref] = {}
         self._display_names: dict[str, str] = {}
@@ -3127,11 +3437,22 @@ class StreamMonitorApp:
         color_button(header, "⚙  修改設定", self.open_settings, NAVY).pack(side=tk.RIGHT)
         self.refresh_settings_status()
 
-        watch = group(root, "監看頻道")
-        watch.pack(fill=tk.X, padx=14, pady=6)
+        pane = tk.PanedWindow(
+            root,
+            orient=tk.VERTICAL,
+            bg=BG,
+            sashwidth=8,
+            sashrelief=tk.RAISED,
+            opaqueresize=True,
+        )
+        pane.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 12))
+
+        top = tk.Frame(pane, bg=BG)
+        watch = group(top, "監看頻道")
+        watch.pack(fill=tk.BOTH, expand=True)
         label(
             watch,
-            "每台可調「像待命」相似度（預設 60%）、略過標題等會變的顏色，並指定待命圖片或影片。開網頁／關網頁分開勾。EventSub 預算 10：只聽開台每台 1，再勾關網頁 +1。顯示名稱下方是這台目前狀態（顏色不同）。名稱太長時可左右拖動這一列，以免看不到移除。",
+            "「像%」是整張畫面要多像待命才算還沒切正片。「容差」只影響略過色。誤報時按「還是待命」：你指定的圖只加當下那張；開台候選會連候選一起收進樣本。名單可拖或滾輪；中間那條可拉高頻道區或日誌。",
         ).pack(fill=tk.X, pady=(0, 6))
         self.eventsub_budget = tk.Label(
             watch, text="", anchor="w", bg=PANEL, fg=MUTED, font=FONT
@@ -3145,6 +3466,7 @@ class StreamMonitorApp:
             side=tk.LEFT, padx=(8, 0)
         )
         self.list_canvas, self.list_frame = attach_hscroll(watch)
+        pane.add(top, minsize=140, height=280)
 
         prefs = load_channel_prefs()
         if not prefs and initial.user_logins:
@@ -3156,8 +3478,9 @@ class StreamMonitorApp:
         self._refresh_eventsub_budget()
         self._schedule_name_lookup()
 
-        control = group(root, "監控控制")
-        control.pack(fill=tk.X, padx=14, pady=6)
+        bottom = tk.Frame(pane, bg=BG)
+        control = group(bottom, "監控控制")
+        control.pack(fill=tk.X, pady=(0, 6))
         self.start_btn = color_button(
             control, "▶  啟動自動監控", self.start_system, GREEN
         )
@@ -3171,11 +3494,11 @@ class StreamMonitorApp:
             fg=MUTED,
         ).pack(fill=tk.X, pady=(6, 0))
 
-        log_box = group(root, "近期事件日誌")
-        log_box.pack(fill=tk.BOTH, expand=True, padx=14, pady=(6, 14))
+        log_box = group(bottom, "近期事件日誌")
+        log_box.pack(fill=tk.BOTH, expand=True)
         self.log_area = scrolledtext.ScrolledText(
             log_box,
-            height=14,
+            height=10,
             state="disabled",
             font=FONT_LOG,
             bg="white",
@@ -3183,6 +3506,7 @@ class StreamMonitorApp:
             bd=1,
         )
         self.log_area.pack(fill=tk.BOTH, expand=True)
+        pane.add(bottom, minsize=200)
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self.process_queue)
@@ -3237,12 +3561,27 @@ class StreamMonitorApp:
             row.set_display_name("查名字中…")
         self.rows.append(row)
         bind_hscroll_drag(self.list_canvas, row.frame)
+        bind_list_wheel(self.list_canvas, row.frame)
+        self._reveal_channel_row()
 
     def _remove_row(self, row: ChannelRow) -> None:
         if row in self.rows:
             self.rows.remove(row)
         row.frame.destroy()
         self._persist_watchlist()
+        self._resync_channel_list()
+
+    def _resync_channel_list(self) -> None:
+        fn = getattr(self.list_canvas, "_resync", None)
+        if callable(fn):
+            fn()
+
+    def _reveal_channel_row(self) -> None:
+        def _go() -> None:
+            self._resync_channel_list()
+            self.list_canvas.yview_moveto(1.0)
+
+        self.root.after_idle(_go)
 
     def _set_rows_enabled(self, enabled: bool) -> None:
         for row in self.rows:
@@ -3386,6 +3725,71 @@ class StreamMonitorApp:
 
     def _set_phase(self, login: str, phase: str) -> None:
         self.root.after(0, lambda lg=login, ph=phase: self._apply_phase(lg, ph))
+
+    def _refresh_row_status(self, login: str) -> None:
+        row = self._row_for_login(login)
+        if row:
+            row.refresh_status()
+
+    def apply_still_standby(self, row: ChannelRow) -> None:
+        name = row.login()
+        if not name:
+            self.log("❌ 請先填這列的頻道登入名稱")
+            return
+        image = load_last_frame(self.standby_dir, name)
+        try:
+            kind, origin, files = confirm_still_standby(
+                self.standby_dir, name, row.ref_origin, image
+            )
+        except Exception as exc:
+            self.log(f"❌ [{name}] {exc}")
+            return
+        row.ref_origin = origin
+        row.refresh_status()
+        self._persist_watchlist()
+        if kind == "append_user":
+            self.log(
+                f"🛠️ [{name}] 已把當下畫面加進你指定的待命圖（現在 {len(files)} 張）。"
+                "開台候選沒動；要整組換成開台截圖請按「用候選」。"
+            )
+        elif kind == "adopt_auto":
+            self.log(
+                f"🛠️ [{name}] 已套用開台候選並補上當下畫面（現在 {len(files)} 張）。"
+            )
+        else:
+            self.log(
+                f"🛠️ [{name}] 已把當下畫面補進開台候選那一組（現在 {len(files)} 張）。"
+            )
+        flag = self._still_flags.get(name)
+        loop = self._loop
+        if flag is not None and loop is not None:
+            loop.call_soon_threadsafe(flag.set)
+            return
+        row_phase = row.phase
+        if row_phase == "main" and loop is not None and self._http is not None:
+            loop.call_soon_threadsafe(
+                lambda lg=name: asyncio.create_task(
+                    self._restart_detect_after_correction(lg)
+                )
+            )
+
+    async def _restart_detect_after_correction(self, login: str) -> None:
+        stop_event = self._stop_event
+        http = self._http
+        if stop_event is None or stop_event.is_set() or http is None:
+            return
+        existing = self._monitor_tasks.get(login)
+        if existing and not existing.done():
+            return
+        self.log(f"🔄 [{login}] 誤報已補正，重新抽幀繼續等正片")
+        await self._start_monitor(
+            login,
+            load_settings(),
+            http,
+            stop_event,
+            already_live=True,
+            started_at=self._started_at.get(login),
+        )
 
     def _set_all_phases(self, phase: str) -> None:
         for row in self.rows:
@@ -3534,6 +3938,9 @@ class StreamMonitorApp:
         finally:
             self._loop = None
             self._stop_event = None
+            self._http = None
+            self._still_flags.clear()
+            self._started_at.clear()
             self._bg_done.set()
             loop.close()
 
@@ -3563,6 +3970,7 @@ class StreamMonitorApp:
         self.log("✅ 模擬模式（SIMULATE=1）：不連 Twitch")
         self.log("✅ Twitch WebSocket 監聽模組已啟動")
         async with httpx.AsyncClient() as http:
+            self._http = http
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=2)
                 return
@@ -3576,6 +3984,7 @@ class StreamMonitorApp:
     async def _run_eventsub(self, settings: Settings, stop_event: asyncio.Event) -> None:
         self.log(f"👀 監看頻道：{', '.join(settings.user_logins)}")
         async with httpx.AsyncClient() as http:
+            self._http = http
             try:
                 token = await ensure_user_token(
                     http,
@@ -3766,6 +4175,8 @@ class StreamMonitorApp:
             self.log(f"ℹ️ {login} 已在監控中，略過重複啟動")
             return
         self._set_phase(login, "detecting")
+        self._started_at[login] = started_at
+        self._still_flags[login] = asyncio.Event()
         self._monitor_tasks[login] = asyncio.create_task(
             self._monitor_wrapper(
                 login,
@@ -3836,6 +4247,10 @@ class StreamMonitorApp:
                     pref=self._active_prefs.get(login) or ChannelPref(login=login),
                     started_at=started_at,
                     on_phase=lambda ph, lg=login: self._set_phase(lg, ph),
+                    on_candidates=lambda lg=login: self.root.after(
+                        0, self._refresh_row_status, lg
+                    ),
+                    still_event=self._still_flags.get(login),
                 )
             if started:
                 self._set_phase(login, "main")
@@ -3857,6 +4272,7 @@ class StreamMonitorApp:
             self.log(f"[{login}] 監控任務已取消")
         finally:
             self._monitor_tasks.pop(login, None)
+            self._still_flags.pop(login, None)
 
 
 if __name__ == "__main__":
