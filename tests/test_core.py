@@ -19,6 +19,7 @@ from app import (
     Settings,
     build_live_message,
     build_start_message,
+    build_offline_message,
     build_webhook_body,
     clamp_similarity_pct,
     event_from_notification,
@@ -188,6 +189,12 @@ class DiscordTests(unittest.TestCase):
             "「貓辣妹」正片開始了\n來去 https://www.twitch.tv/maoramei 看看",
         )
 
+    def test_offline_message_format(self) -> None:
+        self.assertEqual(
+            build_offline_message("貓辣妹", "maoramei"),
+            "「貓辣妹」關了",
+        )
+
     def test_custom_template_keeps_role_mention(self) -> None:
         text = render_notify_template(
             "<@&123456> <實況主名稱> (<實況主ＩＤ>) <實況主網址>",
@@ -230,6 +237,9 @@ class DiscordTests(unittest.TestCase):
             webhook_for_notify("live", settings), "https://discord.example/main"
         )
         self.assertEqual(
+            webhook_for_notify("offline", settings), "https://discord.example/main"
+        )
+        self.assertEqual(
             webhook_for_notify("start", settings), "https://discord.example/start"
         )
         empty_aux = Settings(
@@ -267,6 +277,7 @@ class WatchlistPrefTests(unittest.TestCase):
                             "maoramei",
                             notify_live=True,
                             notify_start=False,
+                            notify_offline=True,
                             open_watch=True,
                             close_watch=True,
                             display_name="貓辣妹",
@@ -283,12 +294,14 @@ class WatchlistPrefTests(unittest.TestCase):
         self.assertEqual(prefs[0].display_name, "貓辣妹")
         self.assertTrue(prefs[0].notify_live)
         self.assertFalse(prefs[0].notify_start)
+        self.assertTrue(prefs[0].notify_offline)
         self.assertTrue(prefs[0].open_watch)
         self.assertTrue(prefs[0].close_watch)
         self.assertFalse(prefs[1].open_watch)
         self.assertFalse(prefs[1].close_watch)
         self.assertFalse(prefs[1].notify_live)
         self.assertTrue(prefs[1].notify_start)
+        self.assertFalse(prefs[1].notify_offline)
         self.assertFalse(prefs[1].open_watch)
         self.assertEqual(prefs[1].display_name, "")
         self.assertEqual(prefs[0].similarity_pct, 70)
@@ -329,6 +342,11 @@ class WatchlistPrefTests(unittest.TestCase):
         self.assertEqual(plan.cost, 10)
         self.assertEqual(eventsub_cost(ChannelPref("x")), 1)
         self.assertEqual(eventsub_cost(ChannelPref("x", close_watch=True)), 2)
+        self.assertEqual(eventsub_cost(ChannelPref("x", notify_offline=True)), 2)
+        self.assertEqual(
+            eventsub_cost(ChannelPref("x", close_watch=True, notify_offline=True)),
+            2,
+        )
         self.assertIn("可聽 7 台", describe_eventsub_plan(plan))
         self.assertIn("10/10", describe_eventsub_plan(plan))
 
@@ -337,6 +355,13 @@ class WatchlistPrefTests(unittest.TestCase):
         plan = plan_eventsub(prefs)
         self.assertEqual(len(plan.included), 10)
         self.assertEqual(plan.skipped, ("u10", "u11"))
+        self.assertEqual(plan.cost, 10)
+
+    def test_eventsub_plan_offline_log_uses_two_each(self) -> None:
+        prefs = [ChannelPref(f"u{i}", notify_offline=True) for i in range(8)]
+        plan = plan_eventsub(prefs)
+        self.assertEqual(len(plan.included), 5)
+        self.assertEqual(plan.skipped, ("u5", "u6", "u7"))
         self.assertEqual(plan.cost, 10)
 
     def test_cdp_urls_and_target_id(self) -> None:

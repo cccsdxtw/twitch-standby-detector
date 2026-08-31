@@ -494,6 +494,7 @@ class Settings:
     confirm_frames: int
     hash_threshold: int
     skip_start_after_min: int
+    discord_offline_template: str = ""
 
     @property
     def ready_for_eventsub(self) -> bool:
@@ -508,6 +509,7 @@ class ChannelPref:
     login: str
     notify_live: bool = True
     notify_start: bool = True
+    notify_offline: bool = False
     open_watch: bool = False
     close_watch: bool = False
     display_name: str = ""
@@ -583,6 +585,7 @@ def load_channel_prefs() -> list[ChannelPref]:
                         login=login,
                         notify_live=bool(item.get("notify_live", True)),
                         notify_start=bool(item.get("notify_start", True)),
+                        notify_offline=bool(item.get("notify_offline", False)),
                         open_watch=bool(item.get("open_watch", False)),
                         close_watch=bool(item.get("close_watch", False)),
                         display_name=str(item.get("display_name") or ""),
@@ -609,6 +612,7 @@ def save_channel_prefs(prefs: list[ChannelPref]) -> None:
             "login": pref.login,
             "notify_live": pref.notify_live,
             "notify_start": pref.notify_start,
+            "notify_offline": pref.notify_offline,
             "open_watch": pref.open_watch,
             "close_watch": pref.close_watch,
             "display_name": pref.display_name,
@@ -884,6 +888,7 @@ def load_settings() -> Settings:
         skip_start_after_min=clamp_skip_start_after_min(
             os.getenv("SKIP_START_AFTER_MIN", str(DEFAULT_SKIP_START_AFTER_MIN))
         ),
+        discord_offline_template=os.getenv("DISCORD_OFFLINE_TEMPLATE") or "",
     )
 
 
@@ -907,11 +912,12 @@ def twitch_channel_url(login: str) -> str:
 
 DEFAULT_LIVE_TEMPLATE = "「<實況主名稱>」在實況了\n來去 <實況主網址> 看看"
 DEFAULT_START_TEMPLATE = "「<實況主名稱>」正片開始了\n來去 <實況主網址> 看看"
+DEFAULT_OFFLINE_TEMPLATE = "「<實況主名稱>」關了"
 NOTIFY_TOKEN_RE = re.compile(r"<([^<>]+)>")
 
 
 def webhook_for_notify(kind: str, settings: Settings) -> str:
-    """kind 為 live 或 start。有填輔助網址時，正片走輔助，開台走主網址。"""
+    """kind 為 live、start 或 offline。有填輔助網址時，正片走輔助，其餘走主網址。"""
     if kind == "start" and settings.discord_webhook_start_url:
         return settings.discord_webhook_start_url
     return settings.discord_webhook_url
@@ -955,6 +961,14 @@ def build_start_message(
 ) -> str:
     return render_notify_template(
         template, display_name, login, default=DEFAULT_START_TEMPLATE
+    )
+
+
+def build_offline_message(
+    display_name: str, login: str, template: str = ""
+) -> str:
+    return render_notify_template(
+        template, display_name, login, default=DEFAULT_OFFLINE_TEMPLATE
     )
 
 
@@ -1949,7 +1963,7 @@ import websockets
 
 
 WS_URL = "wss://eventsub.wss.twitch.tv/ws"
-# 每種事件成本 1。只聽開台＝1，再勾關網頁才加 offline。
+# 每種事件成本 1。只聽開台＝1；勾關網頁或關台通知才加 offline。
 EVENT_ONLINE = "stream.online"
 EVENT_OFFLINE = "stream.offline"
 MAX_EVENTSUB_COST = 10
@@ -1973,7 +1987,7 @@ class EventSubPlan:
 
 def eventsub_types(pref: ChannelPref) -> tuple[str, ...]:
     types = [EVENT_ONLINE]
-    if pref.close_watch:
+    if pref.close_watch or pref.notify_offline:
         types.append(EVENT_OFFLINE)
     return tuple(types)
 
@@ -1983,7 +1997,8 @@ def eventsub_cost(pref: ChannelPref) -> int:
 
 
 def plan_eventsub(
-    prefs: list[ChannelPref], budget: int = MAX_EVENTSUB_COST
+    prefs: list[ChannelPref],
+    budget: int = MAX_EVENTSUB_COST,
 ) -> EventSubPlan:
     included: list[str] = []
     skipped: list[str] = []
@@ -2007,7 +2022,7 @@ def describe_eventsub_plan(plan: EventSubPlan) -> str:
     skip = f"，後面 {len(plan.skipped)} 台這次聽不到" if plan.skipped else ""
     return (
         f"EventSub 預算 {plan.cost}/{plan.budget}，這次可聽 {len(plan.included)} 台"
-        f"（只聽開台最多 {plan.max_online_only}；有勾關網頁各多佔 1，全勾關最多 {plan.max_with_close}）"
+        f"（只聽開台最多 {plan.max_online_only}；關網頁或關台通知各多佔 1，全開最多 {plan.max_with_close}）"
         f"{skip}"
     )
 
@@ -2662,7 +2677,7 @@ async def _kill_all(procs: list[asyncio.subprocess.Process]) -> None:
 
 # === app ===
 
-__version__ = "0.17.0"
+__version__ = "0.18.0"
 
 ROW_PHASES: dict[str, tuple[str, str]] = {
     "idle": ("未監控", MUTED),
@@ -2740,6 +2755,7 @@ class ChannelRow:
 
         self.notify_live_var = tk.BooleanVar(value=pref.notify_live)
         self.notify_start_var = tk.BooleanVar(value=pref.notify_start)
+        self.notify_offline_var = tk.BooleanVar(value=pref.notify_offline)
         self.open_watch_var = tk.BooleanVar(value=pref.open_watch)
         self.close_watch_var = tk.BooleanVar(value=pref.close_watch)
         checks = tk.Frame(self.frame, bg=PANEL)
@@ -2764,6 +2780,16 @@ class ChannelRow:
             activebackground=PANEL,
         )
         self.start_chk.pack(side=tk.LEFT)
+        self.offline_chk = tk.Checkbutton(
+            checks,
+            text="關台通知",
+            variable=self.notify_offline_var,
+            command=self.app._persist_watchlist,
+            bg=PANEL,
+            font=FONT,
+            activebackground=PANEL,
+        )
+        self.offline_chk.pack(side=tk.LEFT)
         self.watch_chk = tk.Checkbutton(
             checks,
             text="開網頁",
@@ -2866,6 +2892,7 @@ class ChannelRow:
             login=name,
             notify_live=bool(self.notify_live_var.get()),
             notify_start=bool(self.notify_start_var.get()),
+            notify_offline=bool(self.notify_offline_var.get()),
             open_watch=bool(self.open_watch_var.get()),
             close_watch=bool(self.close_watch_var.get()),
             display_name=self._saved_display_name(),
@@ -3222,6 +3249,11 @@ class SettingsWindow(tk.Toplevel):
             "正片開始文案",
             current.discord_start_template.strip() or DEFAULT_START_TEMPLATE,
         )
+        self.offline_template = self._text_field(
+            talk_page,
+            "關台文案（該台有勾「關台通知」才會送）",
+            current.discord_offline_template.strip() or DEFAULT_OFFLINE_TEMPLATE,
+        )
         label(
             talk_page,
             "佔位符：<實況主名稱> <實況主ＩＤ> <實況主網址>。身分組請寫 <@&一串數字>。",
@@ -3372,6 +3404,7 @@ class SettingsWindow(tk.Toplevel):
                     "DISCORD_WEBHOOK_START_URL": self.webhook_start.get().strip(),
                     "DISCORD_LIVE_TEMPLATE": self.live_template.get("1.0", "end-1c"),
                     "DISCORD_START_TEMPLATE": self.start_template.get("1.0", "end-1c"),
+                    "DISCORD_OFFLINE_TEMPLATE": self.offline_template.get("1.0", "end-1c"),
                     "SKIP_START_AFTER_MIN": str(self._skip_start_minutes()),
                     "AD_SKIP_SEC": str(
                         clamp_ad_skip_sec(self.ad_skip.get().strip() or "0")
@@ -3390,6 +3423,7 @@ class SettingsWindow(tk.Toplevel):
             self.app.log(f"❌ 設定儲存失敗：{exc}")
             return
         self.app.refresh_settings_status()
+        self.app._refresh_eventsub_budget()
         self.app.log("✅ 設定已儲存。下次按啟動就會用新的連線、時間與發話設定。")
         self.destroy()
 
@@ -4084,7 +4118,7 @@ class StreamMonitorApp:
                         started_at=parse_helix_time(event.get("started_at")),
                     )
                 elif event_type == "stream.offline":
-                    await self._channel_went_offline(login)
+                    await self._channel_went_offline(login, settings, http)
 
             client = EventSubClient(
                 http=http,
@@ -4198,12 +4232,26 @@ class StreamMonitorApp:
         else:
             self.log(f"⚠️ [{login}] 打不開瀏覽器，請自行開 {twitch_channel_url(login)}")
 
-    async def _channel_went_offline(self, login: str) -> None:
+    async def _channel_went_offline(
+        self,
+        login: str,
+        settings: Settings,
+        http: httpx.AsyncClient,
+    ) -> None:
         name = self._display_names.get(login, login)
-        self.log(f"⚫ {name} ({login}) 關台了")
+        self.log(f"⚫ {name} ({login}) 關了")
         self._set_phase(login, "offline")
         self._cancel_monitor(login)
         pref = self._active_prefs.get(login) or ChannelPref(login=login)
+        if pref.notify_offline:
+            await send_webhook(
+                webhook_for_notify("offline", settings),
+                build_offline_message(
+                    name, login, settings.discord_offline_template
+                ),
+                client=http,
+                log=self.log,
+            )
         if not pref.close_watch:
             return
         had_page = self._watch.has_page(login)
