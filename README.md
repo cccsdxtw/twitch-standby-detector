@@ -13,7 +13,7 @@ Twitch 待命畫面 / 正片切換監控。版本 **v0.16.0**。版本號避開 
 
 ## 設定
 
-1. 打開程式後按 **「修改設定」**。左側可切 **呼叫設定**（Twitch ID）、**時間設定**（開頭偵測時限）、**發話設定**（Discord Webhook 與文案）。存在本機 `.env`。
+1. 打開程式後按 **「修改設定」**。左側切頁：**呼叫設定**（圖奇一組 ID、Discord 兩個 Webhook）、**時間設定**（避開開頭的小時／分鐘）、**發話設定**（通知文案）。存在本機 `.env`。
 2. [Twitch Developer Console](https://dev.twitch.tv/console) 建立應用。Redirect URL 可填 `http://localhost`。第一次啟動會 Device Code 登入，token 存 `twitch_token.json`。
 3. 視窗裡新增頻道。名稱前會顯示 Twitch 頭像；列太長可左右拖。每台可開關通知、分開勾「開網頁／關網頁」、調「像待命」相似度（預設 60%）、選略過色（標題等會變的區塊），並選待命圖片或影片。視窗會依勾選算出 EventSub 預算（10）：只聽開台每台 1，再勾關網頁 +1。
 5. **強烈建議**把待命截圖放到 `standby/<登入名>.png`（例如 `standby/lanmeinotbeer.png`）。沒有參考圖時：剛開台會試著抓穩定 baseline；**啟動時已經在直播則略過判定**。

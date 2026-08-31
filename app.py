@@ -2679,7 +2679,7 @@ class SettingsWindow(tk.Toplevel):
         super().__init__(app.root)
         self.app = app
         self.title("修改設定")
-        self.geometry("640x520")
+        self.geometry("640x560")
         self.configure(bg=BG)
         self.transient(app.root)
         current = load_settings()
@@ -2693,6 +2693,7 @@ class SettingsWindow(tk.Toplevel):
         nav = tk.Frame(body, bg=BG, width=118)
         nav.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
         nav.pack_propagate(False)
+        label(nav, "選擇頁面", fg=MUTED).pack(anchor="w", pady=(0, 6))
         content = tk.Frame(body, bg=PANEL)
         content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -2705,7 +2706,7 @@ class SettingsWindow(tk.Toplevel):
             "發話設定": talk_page,
         }
 
-        label(call_page, "連 Twitch 用。存在本機 .env，不會上傳 Git。").pack(
+        label(call_page, "連線用的 ID／網址。存在本機 .env，不會上傳 Git。").pack(
             anchor="w", pady=(0, 8)
         )
         self.client_id = self._field(
@@ -2714,52 +2715,49 @@ class SettingsWindow(tk.Toplevel):
         self.client_secret = self._field(
             call_page, "Twitch Client Secret（可空）", current.twitch_client_secret, "*"
         )
-        label(
-            call_page,
-            "Client ID：Twitch 開發者主控台 → 應用程式 → 管理。\n"
-            "Redirect URL 可填 http://localhost。",
-            fg=MUTED,
-        ).pack(anchor="w", pady=(8, 0))
-
-        label(time_page, "開台超過多久就不再偵測開頭（兩個都 0＝不略過）").pack(
-            fill=tk.X, pady=(0, 4)
-        )
-        skip_row = tk.Frame(time_page, bg=PANEL)
-        skip_row.pack(fill=tk.X, pady=(2, 4))
-        hours, mins = skip_start_hms(current.skip_start_after_min)
-        self.skip_hours = entry(skip_row, None, width=6)
-        self.skip_hours.pack(side=tk.LEFT)
-        self.skip_hours.insert(0, str(hours))
-        tk.Label(skip_row, text=" 小時 ", bg=PANEL, fg=FG, font=FONT).pack(side=tk.LEFT)
-        self.skip_mins = entry(skip_row, None, width=6)
-        self.skip_mins.pack(side=tk.LEFT)
-        self.skip_mins.insert(0, str(mins))
-        tk.Label(skip_row, text=" 分鐘", bg=PANEL, fg=FG, font=FONT).pack(side=tk.LEFT)
-        label(
-            time_page,
-            "例如 0 小時 46 分，或 1 小時 20 分。剛開台仍會偵測；超過此時長就停抽幀。",
-            fg=MUTED,
-        ).pack(anchor="w", pady=(4, 0))
-
-        label(
-            talk_page,
-            "主網址必填才會發 Discord。輔助可空：沒填則開台、正片都走主網址；有填則開台走主、正片走輔助。",
-            fg=MUTED,
-        ).pack(anchor="w", pady=(0, 6))
         self.webhook = self._field(
-            talk_page, "Discord Webhook 網址（主）", current.discord_webhook_url, ""
+            call_page, "Discord Webhook 網址（主／開台）", current.discord_webhook_url, ""
         )
         self.webhook_start = self._field(
-            talk_page,
-            "Discord Webhook 網址（輔助）",
+            call_page,
+            "Discord Webhook 網址（輔助／正片，可空）",
             current.discord_webhook_start_url,
             "",
         )
         label(
-            talk_page,
-            "文案可直接寫 Discord 提及，例如 <@&角色數字ID>。佔位符會替換成該台資料：",
+            call_page,
+            "圖奇一組：Client ID（Secret 可空）。Discord 兩組：主網址給開台；輔助有填才把正片送到另一個頻道，沒填則兩種都走主網址。\n"
+            "Client ID：Twitch 開發者主控台 → 應用程式 → 管理。Webhook：Discord 頻道 → 整合 → 複製網址。",
             fg=MUTED,
-        ).pack(anchor="w", pady=(8, 2))
+        ).pack(anchor="w", pady=(8, 0))
+
+        label(time_page, "避開開頭／正片偵測的時限（兩個都 0＝不略過，會一直偵測）").pack(
+            fill=tk.X, pady=(0, 8)
+        )
+        hours, mins = skip_start_hms(current.skip_start_after_min)
+        hours_box = tk.Frame(time_page, bg=PANEL)
+        hours_box.pack(fill=tk.X, pady=4)
+        label(hours_box, "小時").pack(fill=tk.X)
+        self.skip_hours = entry(hours_box, None, width=8)
+        self.skip_hours.pack(anchor="w")
+        self.skip_hours.insert(0, str(hours))
+        mins_box = tk.Frame(time_page, bg=PANEL)
+        mins_box.pack(fill=tk.X, pady=4)
+        label(mins_box, "分鐘").pack(fill=tk.X)
+        self.skip_mins = entry(mins_box, None, width=8)
+        self.skip_mins.pack(anchor="w")
+        self.skip_mins.insert(0, str(mins))
+        label(
+            time_page,
+            "例如 0 小時 46 分，或 1 小時 20 分。剛開台仍會偵測；超過此時長就停抽幀。",
+            fg=MUTED,
+        ).pack(anchor="w", pady=(8, 0))
+
+        label(
+            talk_page,
+            "自訂 Discord 文案。沒改就用預設。可直接寫 <@&角色數字ID>，或按下面按鈕插入佔位符。",
+            fg=MUTED,
+        ).pack(anchor="w", pady=(0, 6))
         token_row = tk.Frame(talk_page, bg=PANEL)
         token_row.pack(fill=tk.X, pady=(0, 6))
         for token in ("<實況主名稱>", "<實況主ＩＤ>", "<實況主網址>", "<@&>"):
@@ -2778,7 +2776,7 @@ class SettingsWindow(tk.Toplevel):
         )
         label(
             talk_page,
-            "Webhook：Discord 頻道設定 → 整合 → Webhook → 複製網址。",
+            "佔位符：<實況主名稱> <實況主ＩＤ> <實況主網址>。身分組請寫 <@&一串數字>。",
             fg=MUTED,
         ).pack(anchor="w", pady=(6, 0))
 
