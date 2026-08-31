@@ -2248,6 +2248,11 @@ def row_phase_style(phase: str) -> tuple[str, str]:
     return ROW_PHASES.get(phase, ROW_PHASES["idle"])
 
 
+# 固定名字欄寬度，讓每列「開台通知」從同一位置開始。
+NAME_COL_PX = 128
+NAME_COL_H = 40
+
+
 class ChannelRow:
     def __init__(
         self,
@@ -2263,7 +2268,7 @@ class ChannelRow:
 
         self.login_var = tk.StringVar(value=pref.login)
         self.entry = entry(self.frame, self.login_var, width=16)
-        self.entry.pack(side=tk.LEFT, padx=(0, 6))
+        self.entry.pack(side=tk.LEFT, padx=(0, 6), anchor="n")
         self.entry.bind("<FocusOut>", self._on_login_changed)
         self.entry.bind("<Return>", self._on_login_changed)
 
@@ -2271,8 +2276,9 @@ class ChannelRow:
         self.avatar_label = tk.Label(self.frame, bg=PANEL, width=3)
         self.avatar_label.pack(side=tk.LEFT, padx=(0, 4), anchor="n")
 
-        identity = tk.Frame(self.frame, bg=PANEL)
+        identity = tk.Frame(self.frame, bg=PANEL, width=NAME_COL_PX, height=NAME_COL_H)
         identity.pack(side=tk.LEFT, padx=(0, 8), anchor="n")
+        identity.pack_propagate(False)
         self.name_var = tk.StringVar(value=pref.display_name.strip())
         self.name_label = tk.Label(
             identity,
@@ -2281,6 +2287,8 @@ class ChannelRow:
             bg=PANEL,
             fg=MUTED,
             font=FONT_BOLD,
+            wraplength=NAME_COL_PX,
+            justify="left",
         )
         self.name_label.pack(anchor="w")
         self.phase = "idle"
@@ -2300,8 +2308,10 @@ class ChannelRow:
         self.notify_start_var = tk.BooleanVar(value=pref.notify_start)
         self.open_watch_var = tk.BooleanVar(value=pref.open_watch)
         self.close_watch_var = tk.BooleanVar(value=pref.close_watch)
+        checks = tk.Frame(self.frame, bg=PANEL)
+        checks.pack(side=tk.LEFT, padx=(0, 8), anchor="n")
         self.live_chk = tk.Checkbutton(
-            self.frame,
+            checks,
             text="開台通知",
             variable=self.notify_live_var,
             command=self.app._persist_watchlist,
@@ -2311,7 +2321,7 @@ class ChannelRow:
         )
         self.live_chk.pack(side=tk.LEFT)
         self.start_chk = tk.Checkbutton(
-            self.frame,
+            checks,
             text="開始通知",
             variable=self.notify_start_var,
             command=self.app._persist_watchlist,
@@ -2321,7 +2331,7 @@ class ChannelRow:
         )
         self.start_chk.pack(side=tk.LEFT)
         self.watch_chk = tk.Checkbutton(
-            self.frame,
+            checks,
             text="開網頁",
             variable=self.open_watch_var,
             command=self.app._persist_watchlist,
@@ -2331,7 +2341,7 @@ class ChannelRow:
         )
         self.watch_chk.pack(side=tk.LEFT)
         self.close_chk = tk.Checkbutton(
-            self.frame,
+            checks,
             text="關網頁",
             variable=self.close_watch_var,
             command=self.app._persist_watchlist,
@@ -2339,12 +2349,19 @@ class ChannelRow:
             font=FONT,
             activebackground=PANEL,
         )
-        self.close_chk.pack(side=tk.LEFT, padx=(0, 8))
+        self.close_chk.pack(side=tk.LEFT)
 
-        tk.Label(self.frame, text="像", bg=PANEL, fg=MUTED, font=FONT).pack(side=tk.LEFT)
+        tools = tk.Frame(self.frame, bg=PANEL)
+        tools.pack(side=tk.LEFT, anchor="n")
+        self.img_btn = small_button(tools, "選圖片", self._pick_image, BLUE)
+        self.img_btn.pack(side=tk.LEFT, padx=2)
+        self.vid_btn = small_button(tools, "選影片", self._pick_video, PURPLE)
+        self.vid_btn.pack(side=tk.LEFT, padx=2)
+
+        tk.Label(tools, text="像", bg=PANEL, fg=MUTED, font=FONT).pack(side=tk.LEFT)
         self.similarity_var = tk.StringVar(value=str(pref.similarity_pct))
         self.similarity_spin = tk.Spinbox(
-            self.frame,
+            tools,
             from_=1,
             to=99,
             width=3,
@@ -2353,29 +2370,32 @@ class ChannelRow:
             command=self.app._persist_watchlist,
         )
         self.similarity_spin.pack(side=tk.LEFT)
-        tk.Label(self.frame, text="%", bg=PANEL, fg=MUTED, font=FONT).pack(
-            side=tk.LEFT, padx=(0, 6)
+        tk.Label(tools, text="%", bg=PANEL, fg=MUTED, font=FONT).pack(
+            side=tk.LEFT, padx=(0, 4)
         )
         self.similarity_var.trace_add("write", lambda *_: self.app._persist_watchlist())
+
+        self.clear_btn = small_button(tools, "清素材", self._clear_media, GRAY)
+        self.clear_btn.pack(side=tk.LEFT, padx=2)
 
         self.ignore_color = pref.ignore_color.strip()
         self.ignore_tol_var = tk.StringVar(value=str(pref.ignore_tolerance))
         self.color_swatch = tk.Label(
-            self.frame,
+            tools,
             text="  ",
             width=2,
             relief=tk.SOLID,
             bd=1,
             bg=PANEL,
         )
-        self.color_swatch.pack(side=tk.LEFT, padx=(0, 2))
-        self.color_btn = small_button(self.frame, "略過色", self._pick_ignore_color, ORANGE)
+        self.color_swatch.pack(side=tk.LEFT, padx=(4, 2))
+        self.color_btn = small_button(tools, "略過色", self._pick_ignore_color, ORANGE)
         self.color_btn.pack(side=tk.LEFT, padx=2)
-        self.clear_color_btn = small_button(self.frame, "清色", self._clear_ignore_color, GRAY)
+        self.clear_color_btn = small_button(tools, "清色", self._clear_ignore_color, GRAY)
         self.clear_color_btn.pack(side=tk.LEFT, padx=2)
-        tk.Label(self.frame, text="容差", bg=PANEL, fg=MUTED, font=FONT).pack(side=tk.LEFT)
+        tk.Label(tools, text="容差", bg=PANEL, fg=MUTED, font=FONT).pack(side=tk.LEFT)
         self.ignore_tol_spin = tk.Spinbox(
-            self.frame,
+            tools,
             from_=0,
             to=120,
             width=3,
@@ -2383,23 +2403,17 @@ class ChannelRow:
             font=FONT,
             command=self.app._persist_watchlist,
         )
-        self.ignore_tol_spin.pack(side=tk.LEFT, padx=(0, 8))
+        self.ignore_tol_spin.pack(side=tk.LEFT, padx=(0, 4))
         self.ignore_tol_var.trace_add("write", lambda *_: self.app._persist_watchlist())
         self._refresh_swatch()
 
-        self.status = tk.Label(
-            self.frame, text="", anchor="w", width=18, bg=PANEL, font=FONT
-        )
-        self.status.pack(side=tk.LEFT, padx=(0, 8))
-
-        self.img_btn = small_button(self.frame, "選圖片", self._pick_image, BLUE)
-        self.img_btn.pack(side=tk.LEFT, padx=2)
-        self.vid_btn = small_button(self.frame, "選影片", self._pick_video, PURPLE)
-        self.vid_btn.pack(side=tk.LEFT, padx=2)
-        self.clear_btn = small_button(self.frame, "清素材", self._clear_media, GRAY)
-        self.clear_btn.pack(side=tk.LEFT, padx=2)
-        self.remove_btn = small_button(self.frame, "移除", self._remove, RED)
+        self.remove_btn = small_button(tools, "移除", self._remove, RED)
         self.remove_btn.pack(side=tk.LEFT, padx=2)
+
+        self.status = tk.Label(
+            tools, text="", anchor="w", bg=PANEL, fg=MUTED, font=FONT_SMALL
+        )
+        self.status.pack(side=tk.LEFT, padx=(6, 0))
         self.refresh_status()
 
     def login(self) -> str:
