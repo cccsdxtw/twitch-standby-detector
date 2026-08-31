@@ -2248,7 +2248,7 @@ async def _kill_all(procs: list[asyncio.subprocess.Process]) -> None:
 
 # === app ===
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 ROW_PHASES: dict[str, tuple[str, str]] = {
     "idle": ("未監控", MUTED),
