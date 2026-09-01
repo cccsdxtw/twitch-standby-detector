@@ -33,6 +33,8 @@ from app import (
     clamp_ad_skip_sec,
     clamp_frame_interval_sec,
     clamp_confirm_frames,
+    clamp_reconnect_after_sec,
+    setting_looks_like_reconnect_after_sec,
     skip_start_hms,
     skip_start_after_label,
     setting_looks_like_client_id,
@@ -414,6 +416,10 @@ class SkipStartDetectTests(unittest.TestCase):
         self.assertEqual(clamp_frame_interval_sec("12"), 10.0)
         self.assertEqual(clamp_confirm_frames("0"), 1)
         self.assertEqual(clamp_confirm_frames("99"), 10)
+        self.assertEqual(clamp_reconnect_after_sec("15"), 15)
+        self.assertEqual(clamp_reconnect_after_sec("0"), 15)
+        self.assertEqual(clamp_reconnect_after_sec("-3"), 15)
+        self.assertEqual(clamp_reconnect_after_sec("9999"), 600)
 
 
 class SettingGuardTests(unittest.TestCase):
@@ -430,6 +436,9 @@ class SettingGuardTests(unittest.TestCase):
         self.assertTrue(setting_looks_like_frame_interval("0.5"))
         self.assertFalse(setting_looks_like_confirm_frames("0"))
         self.assertTrue(setting_looks_like_confirm_frames("4"))
+        self.assertTrue(setting_looks_like_reconnect_after_sec("15"))
+        self.assertFalse(setting_looks_like_reconnect_after_sec("0"))
+        self.assertFalse(setting_looks_like_reconnect_after_sec("abc"))
 
     def test_ids_and_webhook(self) -> None:
         self.assertTrue(setting_looks_like_client_id(""))

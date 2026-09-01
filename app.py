@@ -494,6 +494,7 @@ class Settings:
     confirm_frames: int
     hash_threshold: int
     skip_start_after_min: int
+    reconnect_after_sec: int = 15
     discord_offline_template: str = ""
 
     @property
@@ -740,6 +741,21 @@ def clamp_confirm_frames(value: object, default: int = 4) -> int:
     return min(max(frames, 1), 10)
 
 
+DEFAULT_RECONNECT_AFTER_SEC = 15
+
+
+def clamp_reconnect_after_sec(
+    value: object, default: int = DEFAULT_RECONNECT_AFTER_SEC
+) -> int:
+    try:
+        seconds = int(float(value))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if seconds < 1:
+        return default
+    return min(seconds, 600)
+
+
 def _fmt_setting_number(value: float) -> str:
     if float(value) == int(value):
         return str(int(value))
@@ -797,6 +813,15 @@ def setting_looks_like_confirm_frames(raw: str) -> bool:
     if not SETTING_INT_RE.fullmatch(text):
         return False
     return 1 <= int(text) <= 10
+
+
+def setting_looks_like_reconnect_after_sec(raw: str) -> bool:
+    text = (raw or "").strip()
+    if not text:
+        return True
+    if not SETTING_INT_RE.fullmatch(text):
+        return False
+    return 1 <= int(text) <= 600
 
 
 def skip_start_hms(minutes: int) -> tuple[int, int]:
@@ -887,6 +912,9 @@ def load_settings() -> Settings:
         hash_threshold=max(_env_int("HASH_THRESHOLD", 16), 1),
         skip_start_after_min=clamp_skip_start_after_min(
             os.getenv("SKIP_START_AFTER_MIN", str(DEFAULT_SKIP_START_AFTER_MIN))
+        ),
+        reconnect_after_sec=clamp_reconnect_after_sec(
+            os.getenv("EVENTSUB_RECONNECT_SEC", str(DEFAULT_RECONNECT_AFTER_SEC))
         ),
         discord_offline_template=os.getenv("DISCORD_OFFLINE_TEMPLATE") or "",
     )
@@ -2085,6 +2113,7 @@ class EventSubClient:
         log: LogFn,
         on_event: EventFn,
         events_by_login: dict[str, tuple[str, ...]] | None = None,
+        reconnect_after_sec: int = DEFAULT_RECONNECT_AFTER_SEC,
     ) -> None:
         self.http = http
         self.client_id = client_id
@@ -2095,36 +2124,38 @@ class EventSubClient:
         }
         self.log = log
         self.on_event = on_event
+        self.reconnect_after_sec = clamp_reconnect_after_sec(reconnect_after_sec)
 
     async def run(self, stop_event: asyncio.Event) -> None:
         url = WS_URL
         resubscribe = True
-        backoff = 2.0
+        delay = float(self.reconnect_after_sec)
         while not stop_event.is_set():
             try:
-                await self._run_session(url, resubscribe=resubscribe, stop_event=stop_event)
-                url = WS_URL
-                resubscribe = True
-                backoff = 2.0
+                await self._run_session(
+                    url, resubscribe=resubscribe, stop_event=stop_event
+                )
+                if stop_event.is_set():
+                    return
+                self.log(f"⚠️ EventSub 連線結束，{delay:.0f} 秒後重連")
             except EventSubReconnect as exc:
                 self.log("🔄 收到 session_reconnect，改接新的 WebSocket…")
                 url = exc.url
                 resubscribe = False
-                backoff = 2.0
+                continue
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 if stop_event.is_set():
                     return
-                self.log(f"⚠️ EventSub 連線中斷：{exc}，{backoff:.0f} 秒後重試")
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=backoff)
-                    return
-                except asyncio.TimeoutError:
-                    pass
-                url = WS_URL
-                resubscribe = True
-                backoff = min(backoff * 2, 60)
+                self.log(f"⚠️ EventSub 連線中斷：{exc}，{delay:.0f} 秒後重連")
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                return
+            except asyncio.TimeoutError:
+                pass
+            url = WS_URL
+            resubscribe = True
 
     async def _run_session(
         self,
@@ -2134,7 +2165,12 @@ class EventSubClient:
         stop_event: asyncio.Event,
     ) -> None:
         self.log(f"🔌 連線 EventSub：{url}")
-        async with websockets.connect(url, ping_interval=None, close_timeout=5) as ws:
+        async with websockets.connect(
+            url,
+            ping_interval=None,
+            close_timeout=5,
+            open_timeout=10,
+        ) as ws:
             welcome_raw = await _recv_or_stop(ws, stop_event, 15)
             if welcome_raw is None:
                 return
@@ -2677,7 +2713,7 @@ async def _kill_all(procs: list[asyncio.subprocess.Process]) -> None:
 
 # === app ===
 
-__version__ = "0.18.0"
+__version__ = "0.19.0"
 
 ROW_PHASES: dict[str, tuple[str, str]] = {
     "idle": ("未監控", MUTED),
@@ -3227,6 +3263,14 @@ class SettingsWindow(tk.Toplevel):
             page="時間設定",
             validator=setting_looks_like_confirm_frames,
         )
+        self.reconnect_after = self._field(
+            time_page,
+            "網路中斷後幾秒重連 EventSub（1–600，預設 15）",
+            str(current.reconnect_after_sec),
+            "",
+            page="時間設定",
+            validator=setting_looks_like_reconnect_after_sec,
+        )
 
         label(
             talk_page,
@@ -3416,6 +3460,12 @@ class SettingsWindow(tk.Toplevel):
                     ),
                     "CONFIRM_FRAMES": str(
                         clamp_confirm_frames(self.confirm_frames.get().strip() or "4")
+                    ),
+                    "EVENTSUB_RECONNECT_SEC": str(
+                        clamp_reconnect_after_sec(
+                            self.reconnect_after.get().strip()
+                            or str(DEFAULT_RECONNECT_AFTER_SEC)
+                        )
                     ),
                 }
             )
@@ -4128,6 +4178,7 @@ class StreamMonitorApp:
                 log=self.log,
                 on_event=on_event,
                 events_by_login=events_by_login,
+                reconnect_after_sec=settings.reconnect_after_sec,
             )
             if eventsub_ids:
                 detail = [
